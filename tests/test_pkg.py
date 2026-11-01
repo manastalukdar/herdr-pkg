@@ -53,6 +53,12 @@ class FakeGitHub:
     def topic(self, topic):
         return self.topics.get(topic, [])
 
+    def blob(self, repo, sha):
+        return subprocess.run(["git", "-C", self.repos[repo], "cat-file", "blob", sha], check=True, capture_output=True).stdout
+
+    def resolve(self, repo, ref=None):
+        return git(self.repos[repo], "rev-parse", ref or "HEAD").strip()
+
     def index(self):
         out = {}
         for t in ("herdr-mod", "herdr-layout"):
@@ -93,6 +99,8 @@ class PkgTest(unittest.TestCase):
         self.gh = FakeGitHub({"o/examples": self.up, "o/other": self.up},
                              {"herdr-mod": [{"repo": "o/other", "stars": 1}, {"repo": "o/examples", "stars": 9}]})
         self.home = pkg.Home(self.home_dir)
+        self.check_ok = True
+        self.home.check = lambda path: (self.check_ok, "" if self.check_ok else "boom")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -182,6 +190,108 @@ class PkgTest(unittest.TestCase):
         self.install("stats", "v3")
         self.run_cmd("adopt", "--dry-run")
         self.assertEqual(self.home.load(), {})
+
+
+    # ---- update
+
+    def commit_upstream(self, rel, text, msg):
+        write(os.path.join(self.up, rel), text)
+        git(self.up, "add", "-A")
+        git(self.up, "commit", "-q", "-m", msg)
+        return git(self.up, "rev-parse", "HEAD").strip()
+
+    def read(self, rel):
+        with open(os.path.join(self.home_dir, rel)) as f:
+            return f.read()
+
+    def test_update_untouched_copy_takes_upstream(self):
+        self.install("stats", "v2")
+        self.run_cmd("adopt")
+        r = self.run_cmd("update")["items"][0]
+        self.assertEqual((r["status"], r["to"]), ("updated", self.commits[2]))
+        self.assertIn("// v3", self.read("mods/stats/main.js"))
+        self.assertTrue(os.path.exists(os.path.join(self.home_dir, "mods", "stats", "gpui-kit.d.ts")))  # generated files kept
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "current")
+
+    def test_update_merges_a_local_patch(self):
+        # upstream main.js grows a line at the end; the local copy patched the top
+        lines = "".join(f"line {i}\n" for i in range(12))
+        base = self.commit_upstream("ex/mods/stats/main.js", "// v3\n" + lines, "longer")
+        self.install("stats", "v3", extra=lines.replace("export default 1;\n", ""))
+        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "w") as f:
+            f.write("// v3 patched here\n" + lines)
+        self.run_cmd("adopt")
+        rec = self.home.load()["mod:stats"]
+        self.assertEqual((rec["commit"], rec["modified"]), (base, ["main.js"]))
+        self.commit_upstream("ex/mods/stats/main.js", "// v3\n" + lines + "upstream addition\n", "add")
+        r = self.run_cmd("update")["items"][0]
+        self.assertEqual((r["status"], r["merged"]), ("updated", ["main.js"]))
+        text = self.read("mods/stats/main.js")
+        self.assertIn("patched here", text)
+        self.assertIn("upstream addition", text)
+        self.assertEqual(self.home.load()["mod:stats"]["modified"], ["main.js"])  # still carries the patch
+
+    def test_update_conflict_writes_nothing(self):
+        self.install("stats", "v3")
+        self.run_cmd("adopt")
+        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "w") as f:
+            f.write("// mine\nexport default 1;\n")
+        self.commit_upstream("ex/mods/stats/main.js", "// theirs\nexport default 1;\n", "v4")
+        r = self.run_cmd("update")["items"][0]
+        self.assertEqual((r["status"], r["conflicts"]), ("conflict", ["main.js"]))
+        self.assertIn("// mine", self.read("mods/stats/main.js"))
+        with open(os.path.join(r["conflicts_dir"], "main.js")) as f:
+            self.assertIn("<<<<<<<", f.read())
+
+    def test_update_rolls_back_when_check_fails(self):
+        self.install("stats", "v2")
+        self.run_cmd("adopt")
+        self.check_ok = False
+        r = self.run_cmd("update")["items"][0]
+        self.assertEqual(r["status"], "check failed, rolled back")
+        self.assertIn("// v2", self.read("mods/stats/main.js"))
+        self.assertEqual(self.home.load()["mod:stats"]["commit"], self.commits[1])
+
+    # ---- install / remove
+
+    def test_install_reviews_then_installs_and_binds_free_keys(self):
+        write(os.path.join(self.up, "ex", "keys.json"), json.dumps({"global": {"alt-shift-s": "mod.open:stats", "alt-x": "mod.open:stats"}}))
+        write(os.path.join(self.up, "ex", "mods", "stats", "main.js"), "const r = exec('git');\n")
+        git(self.up, "add", "-A")
+        git(self.up, "commit", "-q", "-m", "keys")
+        write(os.path.join(self.home_dir, "keys.json"), json.dumps({"global": {"alt-x": "pane.zoom"}}))
+        r = self.run_cmd("install", "o/examples/ex")
+        self.assertFalse(r["installed"])
+        self.assertEqual(r["review"]["mods"][0]["risks"], {"runs programs": ["main.js"]})
+        self.assertFalse(os.path.exists(os.path.join(self.home_dir, "mods", "stats")))
+        r = self.run_cmd("install", "o/examples/ex", "--yes")
+        self.assertEqual([(i["kind"], i["name"]) for i in r["items"]], [("mod", "stats"), ("layout", "board")])
+        keys = json.loads(self.read("keys.json"))["global"]
+        self.assertEqual(keys, {"alt-x": "pane.zoom", "alt-shift-s": "mod.open:stats"})  # taken key left alone
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "current")
+        # removing unbinds what it bound; a layout using the mod blocks it until --force
+        write(os.path.join(self.home_dir, "layouts", "mine.json"), '{"content": {"mod": "stats"}}')
+        self.assertFalse(self.run_cmd("remove", "stats", "--kind", "mod")["ok"])
+        r = self.run_cmd("remove", "stats", "--kind", "mod", "--force")
+        self.assertTrue(r["ok"])
+        self.assertFalse(os.path.exists(os.path.join(self.home_dir, "mods", "stats")))
+        self.assertEqual(json.loads(self.read("keys.json"))["global"], {"alt-x": "pane.zoom"})
+
+    def test_install_refuses_a_name_clash(self):
+        self.install("stats", "mine")
+        r = self.run_cmd("install", "o/examples/ex", "--yes")
+        self.assertFalse(r["ok"])
+        self.assertIn("// mine", self.read("mods/stats/main.js"))
+
+    def test_install_rolls_back_when_check_fails(self):
+        self.check_ok = False
+        self.assertFalse(self.run_cmd("install", "o/examples/ex", "--yes")["ok"])
+        self.assertFalse(os.path.exists(os.path.join(self.home_dir, "mods", "stats")))
+
+    def test_remove_untracked_is_refused(self):
+        self.install("nowhere", "zz")
+        self.assertFalse(self.run_cmd("remove", "nowhere")["ok"])
+        self.assertTrue(os.path.exists(os.path.join(self.home_dir, "mods", "nowhere")))
 
 
 if __name__ == "__main__":

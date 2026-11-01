@@ -6,17 +6,25 @@
         [--import FILE]       ...using a sources.json ({mods|layouts: {name: {repo, path, commit}}})
         [--from OWNER/REPO]   ...from this repo (with one NAME)
   pkg.py outdated             which tracked mods/layouts have upstream updates
+  pkg.py update [NAME...]     update them; your local edits are merged in (three-way)
+  pkg.py install OWNER/REPO[/SUBDIR] [--ref REF] [--yes]
+                              review what a mod/layout package does; with --yes, install it
+  pkg.py remove NAME [--kind mod|layout] [--force]
 
 Add --json for machine-readable output (the dialog uses it). Standard library only (Python
 3.8+); talks to GitHub through `gh api` when it's logged in, else the REST API (GITHUB_TOKEN
 helps past 60 requests an hour). State: <herdr-app home>/data/pkg/packages.json.
 """
 import argparse
+import base64
+import difflib
 import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.parse
@@ -109,6 +117,38 @@ class Home:
             f.write("\n")
         os.replace(tmp, os.path.join(self.data, "packages.json"))
 
+    def check(self, path):
+        """`herdr-app check` on a mod folder: (ok, output). Layouts have no checker: always ok."""
+        if not os.path.isdir(path) or not _which("herdr-app"):
+            return True, ""
+        r = subprocess.run(["herdr-app", "check", path], capture_output=True, text=True)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+    def keys(self):
+        try:
+            with open(os.path.join(self.root, "keys.json")) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+
+    def save_keys(self, keys):
+        with open(os.path.join(self.root, "keys.json"), "w") as f:
+            json.dump(keys, f, indent=2)
+            f.write("\n")
+
+    def users(self, mod):
+        """Your layouts whose blocks use this mod."""
+        out = []
+        for kind, name in self.inventory():
+            if kind == "layout":
+                try:
+                    with open(self.path("layout", name)) as f:
+                        if re.search(r'"mod"\s*:\s*"%s"' % re.escape(mod), f.read()):
+                            out.append(name)
+                except OSError:
+                    pass
+        return out
+
     def log(self, event, **fields):
         os.makedirs(self.data, exist_ok=True)
         with open(os.path.join(self.data, "log.jsonl"), "a") as f:
@@ -155,6 +195,12 @@ class GitHub:
             json.dump(value, f)
         return value
 
+    def resolve(self, repo, ref=None):
+        """A branch, tag or sha (default: the default branch) as a commit sha."""
+        if ref and re.fullmatch(r"[0-9a-f]{40}", ref):
+            return ref
+        return self._get(f"repos/{repo}/commits/{urllib.parse.quote(ref or 'HEAD')}")["sha"]
+
     def head(self, repo):
         """The default branch's newest commit sha."""
         info = self._get(f"repos/{repo}")
@@ -166,6 +212,18 @@ class GitHub:
             t = self._get(f"repos/{repo}/git/trees/{commit}?recursive=1")
             return {e["path"]: e["sha"] for e in t["tree"] if e["type"] == "blob"}
         return self._cached(f"trees/{commit}.json", None, fetch)
+
+    def blob(self, repo, sha):
+        """A file's bytes by its blob sha (cached for good)."""
+        p = os.path.join(self.cache, "blobs", sha)
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                return f.read()
+        data = base64.b64decode(self._get(f"repos/{repo}/git/blobs/{sha}")["content"])
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        return data
 
     def history(self, repo, path, limit=HISTORY):
         """Commits on the default branch that changed `path`, newest first: [(sha, date, subject)]."""
@@ -248,29 +306,47 @@ def compare(local, upstream):
     return (1 - len(differ) / len(keys) if keys else 0.0), differ
 
 
-def locate(gh, repo, kind, name, local, path=None):
+def locate(gh, repo, kind, name, local, path=None, read=None):
     """Find the commit of `repo` this local copy came from.
 
     Walks the commits that changed the package's path, newest first, and returns the first one
-    whose files equal the local ones; failing that, the closest one, marked modified. None when
-    the repo has no such package."""
+    whose files equal the local ones; failing that, the closest one, marked modified: most files
+    equal, then (with `read(rel)` giving the local bytes) the most lines in common in the files
+    that differ, so a patched copy gets the commit it was patched on. None when the repo has no
+    such package."""
     if path is None:
         paths = package_paths(gh.tree(repo, gh.head(repo)), kind, name)
         if not paths:
             return None
         path = paths[0]
-    best = None
+    cands = []
     for sha, date, subject in gh.history(repo, path):
         upstream = files_at(gh.tree(repo, sha), kind, path)
         if not upstream:
             continue
         score, differ = compare(local, upstream)
         cand = {"source": repo, "path": path, "commit": sha, "date": date, "subject": subject,
-                "score": round(score, 3), "modified": differ}
+                "score": round(score, 3), "modified": differ, "_up": upstream}
         if not differ:
-            return cand
-        if best is None or score > best["score"]:
-            best = cand
+            cands = [cand]
+            break
+        cands.append(cand)
+    if not cands:
+        return None
+    top = max(c["score"] for c in cands)
+    tied = [c for c in cands if c["score"] == top]
+    if len(tied) > 1 and read:
+        def lines_in_common(c):
+            total = 0.0
+            for rel in c["modified"]:
+                if rel in local and rel in c["_up"]:
+                    mine = read(rel).decode("utf-8", "replace").splitlines()
+                    theirs = gh.blob(repo, c["_up"][rel]).decode("utf-8", "replace").splitlines()
+                    total += difflib.SequenceMatcher(None, mine, theirs, autojunk=False).ratio()
+            return total
+        tied.sort(key=lines_in_common, reverse=True)  # stable: newest wins a tie
+    best = dict(tied[0])
+    best.pop("_up")
     return best
 
 
@@ -337,6 +413,7 @@ def cmd_adopt(home, args, gh):
     index = None
     for kind, name in todo:
         local = home.files(kind, name)
+        read = lambda rel, k=kind, n=name: read_local(home, k, n, rel)  # noqa: E731
         found = None
         try:
             if args.source:
@@ -345,10 +422,10 @@ def cmd_adopt(home, args, gh):
                 hint = None
                 if sub:
                     hint = f"{sub}/mods/{name}" if kind == "mod" else f"{sub}/layouts/{name}.json"
-                found = locate(gh, repo, kind, name, local, hint)
+                found = locate(gh, repo, kind, name, local, hint, read)
             elif (kind, name) in imported:
                 e = imported[(kind, name)]
-                found = locate(gh, e["repo"], kind, name, local, e["path"])
+                found = locate(gh, e["repo"], kind, name, local, e["path"], read)
             else:
                 if index is None:
                     index = gh.index()
@@ -356,7 +433,7 @@ def cmd_adopt(home, args, gh):
                                key=lambda c: (-similarity(c[0], name), -c[2]))
                 for repo, path, _ in cands:
                     try:
-                        cand = locate(gh, repo, kind, name, local, path)
+                        cand = locate(gh, repo, kind, name, local, path, read)
                     except LookupError:
                         continue
                     if cand and (found is None or cand["score"] > found["score"]):
@@ -380,6 +457,13 @@ def cmd_adopt(home, args, gh):
     return {"adopted": adopted, "skipped": skipped, "untracked": left, "github_calls": gh.calls, "dry_run": args.dry_run}
 
 
+def same_files(gh, rec, latest):
+    """True when the package's files at `latest` equal those at the installed commit (the
+    installed commit may be a newer repo commit that didn't touch this path)."""
+    t = lambda c: files_at(gh.tree(rec["source"], c), rec["kind"], rec["path"])  # noqa: E731
+    return latest == rec["commit"] or t(latest) == t(rec["commit"])
+
+
 def cmd_outdated(home, args, gh):
     out = []
     for key, rec in sorted(home.load().items()):
@@ -390,9 +474,267 @@ def cmd_outdated(home, args, gh):
             continue
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "installed": rec["commit"],
                 "latest": sha, "date": date, "subject": subject, "modified": rec.get("modified", [])}
-        item["status"] = "current" if sha == rec["commit"] else "update"
+        item["status"] = "current" if same_files(gh, rec, sha) else "update"
         out.append(item)
     return {"items": out}
+
+
+def merge3(base, ours, theirs):
+    """git merge-file on three byte strings: (merged bytes, conflicted?)."""
+    with tempfile.TemporaryDirectory() as d:
+        paths = []
+        for n, data in (("ours", ours), ("base", base), ("theirs", theirs)):
+            paths.append(os.path.join(d, n))
+            with open(paths[-1], "wb") as f:
+                f.write(data)
+        r = subprocess.run(["git", "merge-file", "-p", "-L", "yours", "-L", "installed", "-L", "upstream", *paths],
+                           capture_output=True)
+        return r.stdout, r.returncode != 0
+
+
+def read_local(home, kind, name, rel):
+    p = home.path(kind, name) if kind == "layout" else os.path.join(home.path(kind, name), rel)
+    with open(p, "rb") as f:
+        return f.read()
+
+
+def plan_update(home, gh, rec, latest):
+    """What updating `rec` to `latest` writes: ({rel: bytes or None to delete}, [conflicted rel], merged)."""
+    kind, name = rec["kind"], rec["name"]
+    base = files_at(gh.tree(rec["source"], rec["commit"]), kind, rec["path"])
+    theirs = files_at(gh.tree(rec["source"], latest), kind, rec["path"])
+    ours = home.files(kind, name)
+    writes, conflicts, merged = {}, [], []
+    for rel in sorted(set(base) | set(ours) | set(theirs)):
+        b, o, t = base.get(rel), ours.get(rel), theirs.get(rel)
+        if o == t or t == b:
+            continue  # nothing new upstream, or the same change on both sides
+        if o == b:
+            writes[rel] = gh.blob(rec["source"], t) if t else None  # untouched here: take upstream's
+            continue
+        if b and o and t:  # changed on both sides: merge
+            data, conflict = merge3(gh.blob(rec["source"], b), read_local(home, kind, name, rel), gh.blob(rec["source"], t))
+            writes[rel] = data
+            (conflicts if conflict else merged).append(rel)
+        else:  # added on both sides, or deleted on one and changed on the other
+            conflicts.append(rel)
+            writes[rel] = gh.blob(rec["source"], t) if t else None
+    return writes, conflicts, merged
+
+
+def apply_files(home, kind, name, writes, fresh=False):
+    """Write `writes` into the mod folder / layout file, through a staged copy and a swap; on a failed
+    `herdr-app check` the old one is put back. Returns (ok, check output)."""
+    dest = home.path(kind, name)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(home.data, "backup", f"{kind}-{name}-{stamp}")
+    os.makedirs(os.path.dirname(backup), exist_ok=True)
+    if kind == "layout":
+        (rel, data), = writes.items()
+        if os.path.exists(dest):
+            shutil.copy2(dest, backup)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + ".pkg-tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        return True, ""
+    stage = dest + ".pkg-new"
+    shutil.rmtree(stage, ignore_errors=True)
+    if os.path.isdir(dest) and not fresh:
+        shutil.copytree(dest, stage, symlinks=True)
+    else:
+        os.makedirs(stage)
+    for rel, data in writes.items():
+        p = os.path.join(stage, rel)
+        if data is None:
+            if os.path.exists(p):
+                os.remove(p)
+            continue
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+    if os.path.isdir(dest):
+        os.replace(dest, backup)
+    os.replace(stage, dest)
+    ok, out = home.check(dest)
+    if not ok:
+        shutil.rmtree(dest)
+        if os.path.isdir(backup):
+            os.replace(backup, dest)
+    return ok, out
+
+
+def cmd_update(home, args, gh):
+    packages = home.load()
+    names = set(args.names or [])
+    out = []
+    for key, rec in sorted(packages.items()):
+        if names and rec["name"] not in names:
+            continue
+        item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "from": rec["commit"]}
+        try:
+            latest, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
+            if same_files(gh, rec, latest):
+                out.append({**item, "status": "current"})
+                continue
+            writes, conflicts, merged = plan_update(home, gh, rec, latest)
+        except (LookupError, IndexError) as e:
+            out.append({**item, "status": "error", "reason": str(e)})
+            continue
+        item.update(to=latest, date=date, subject=subject, merged=merged, conflicts=conflicts)
+        if conflicts:
+            # Nothing is written: the merged files (with conflict markers) go aside for a person.
+            d = os.path.join(home.data, "conflicts", rec["name"])
+            for rel in conflicts:
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(writes[rel] or b"")
+            out.append({**item, "status": "conflict", "conflicts_dir": d})
+            home.log("conflict", kind=rec["kind"], name=rec["name"], to=latest, files=conflicts)
+            continue
+        if args.dry_run:
+            out.append({**item, "status": "would update", "files": sorted(writes)})
+            continue
+        ok, check = apply_files(home, rec["kind"], rec["name"], writes)
+        if not ok:
+            out.append({**item, "status": "check failed, rolled back", "reason": check})
+            home.log("rollback", kind=rec["kind"], name=rec["name"], to=latest)
+            continue
+        theirs = files_at(gh.tree(rec["source"], latest), rec["kind"], rec["path"])
+        rec.update(commit=latest, files=home.files(rec["kind"], rec["name"]),
+                   modified=compare(home.files(rec["kind"], rec["name"]), theirs)[1], at=time.strftime("%Y-%m-%d"))
+        out.append({**item, "status": "updated", "files": sorted(writes)})
+        home.log("update", kind=rec["kind"], name=rec["name"], source=rec["source"], to=latest, merged=merged)
+    if not args.dry_run:
+        home.save(packages)
+    return {"items": out}
+
+
+# What AGENTS.md asks to tell the person before adding a mod. A text match on the source, so it
+# can over-report, never prove a mod safe. (After mod-manager's scan, jacksonpires, MIT.)
+RISKS = [
+    ("runs programs", re.compile(r"\bexec\s*\(|\bhc\s*\(|subprocess|child_process")),
+    ("uses the network", re.compile(r"\bfetch\s*\(|WebSocket|urllib|curl ")),
+    ("reads files", re.compile(r"readTextFile\s*\(|watchFolder\s*\(|open\(")),
+    ("writes files", re.compile(r"writeTextFile\s*\(|\brm\b|unlink|rmtree")),
+]
+
+
+def find_package(tree, sub):
+    """Mods, layouts and keys.json of the package at `sub` ("" = repo root) in a tree."""
+    base = sub.strip("/") + "/" if sub.strip("/") else ""
+    mods = sorted({m.group(1) for p in tree for m in [re.match(re.escape(base) + r"mods/([^/]+)/", p)] if m})
+    layouts = sorted(p[len(base) + 8:-5] for p in tree if re.fullmatch(re.escape(base) + r"layouts/[^/]+\.json", p))
+    prefixes = sorted({m.group(1) or "" for p in tree for m in [re.match(r"(?:(.+)/)?mods/[^/]+/main\.js$", p)] if m})
+    return {"base": base, "mods": mods, "layouts": layouts, "keys": (base + "keys.json") in tree, "prefixes": prefixes}
+
+
+def cmd_install(home, args, gh):
+    parts = args.source.strip("/").replace("https://github.com/", "").split("/")
+    repo, sub = "/".join(parts[:2]), "/".join(p for p in parts[2:] if p not in ("tree", "main", "master"))
+    commit = gh.resolve(repo, args.ref)
+    tree = gh.tree(repo, commit)
+    pkgf = find_package(tree, sub)
+    if not pkgf["mods"] and not pkgf["layouts"]:
+        where = ", ".join(p or "(root)" for p in pkgf["prefixes"]) or "none"
+        return {"ok": False, "reason": f"no mods/ or layouts/ at {sub or 'the repo root'}; packages in this repo: {where}"}
+    base, packages, keys = pkgf["base"], home.load(), home.keys()
+    review = {"source": repo, "subdir": sub, "commit": commit, "mods": [], "layouts": [], "keys": [], "clashes": []}
+    for m in pkgf["mods"]:
+        files = files_at(tree, "mod", f"{base}mods/{m}")
+        risks = {}
+        for rel, sha in files.items():
+            if re.search(r"\.(m?js|py|sh|json)$", rel):
+                text = gh.blob(repo, sha).decode("utf-8", "replace")
+                for label, rx in RISKS:
+                    if rx.search(text):
+                        risks.setdefault(label, []).append(rel)
+        review["mods"].append({"name": m, "files": sorted(files), "risks": risks})
+        if os.path.exists(home.path("mod", m)) or m in home.shipped:
+            review["clashes"].append(f"mod {m} already exists")
+    for lay in pkgf["layouts"]:
+        review["layouts"].append({"name": lay})
+        if os.path.exists(home.path("layout", lay)) or f"layout:{lay}" in home.shipped:
+            review["clashes"].append(f"layout {lay} already exists")
+    if pkgf["keys"]:
+        theirs = json.loads(gh.blob(repo, tree[base + "keys.json"]))
+        for section, binds in theirs.items():
+            for k, action in binds.items():
+                have = keys.get(section, {}).get(k)
+                review["keys"].append({"section": section, "key": k, "action": action,
+                                       "taken_by": have if have and have != action else None})
+    review["has_recipe"] = (base + "RECIPE.md") in tree
+    review["has_preview"] = (base + "preview.png") in tree
+    if review["clashes"]:
+        return {"ok": False, "review": review, "reason": "name clash: remove or rename yours first (installing never overwrites)"}
+    if not args.yes:
+        return {"ok": True, "review": review, "installed": False, "next": "run again with --yes to install"}
+    done = []
+    for m in pkgf["mods"]:
+        files = files_at(tree, "mod", f"{base}mods/{m}")
+        ok, check = apply_files(home, "mod", m, {rel: gh.blob(repo, sha) for rel, sha in files.items()}, fresh=True)
+        if not ok:
+            shutil.rmtree(home.path("mod", m), ignore_errors=True)
+            for k, n in done:
+                if k == "mod":
+                    shutil.rmtree(home.path("mod", n), ignore_errors=True)
+                else:
+                    os.remove(home.path("layout", n))
+            return {"ok": False, "review": review, "reason": f"herdr-app check failed for {m}: {check}"}
+        done.append(("mod", m))
+    for lay in pkgf["layouts"]:
+        path = f"{base}layouts/{lay}.json"
+        apply_files(home, "layout", lay, {lay + ".json": gh.blob(repo, tree[path])})
+        done.append(("layout", lay))
+    bound = []
+    for k in review["keys"]:
+        if not k["taken_by"] and keys.get(k["section"], {}).get(k["key"]) != k["action"]:
+            keys.setdefault(k["section"], {})[k["key"]] = k["action"]
+            bound.append(k)
+    if bound:
+        home.save_keys(keys)
+    for kind, n in done:
+        path = f"{base}mods/{n}" if kind == "mod" else f"{base}layouts/{n}.json"
+        packages[f"{kind}:{n}"] = {"kind": kind, "name": n, "source": repo, "path": path, "commit": commit,
+                                   "modified": [], "files": home.files(kind, n), "adopted": False,
+                                   "keys": [k for k in bound], "at": time.strftime("%Y-%m-%d")}
+        home.log("install", kind=kind, name=n, source=repo, commit=commit)
+    home.save(packages)
+    return {"ok": True, "review": review, "installed": True, "items": [{"kind": k, "name": n} for k, n in done],
+            "keys_bound": bound, "skipped_keys": [k for k in review["keys"] if k["taken_by"]]}
+
+
+def cmd_remove(home, args):
+    packages = home.load()
+    hits = [r for r in packages.values() if r["name"] == args.name and (not args.kind or r["kind"] == args.kind)]
+    if not hits:
+        return {"ok": False, "reason": f"{args.name} isn't tracked by herdr-pkg: remove it by hand (or adopt it first)"}
+    if len(hits) > 1:
+        return {"ok": False, "reason": f"{args.name} is both a mod and a layout: add --kind"}
+    rec = hits[0]
+    if rec["kind"] == "mod":
+        users = home.users(rec["name"])
+        if users and not args.force:
+            return {"ok": False, "reason": f"layouts still use it: {', '.join(users)} (edit them, or --force)"}
+    p = home.path(rec["kind"], rec["name"])
+    backup = os.path.join(home.data, "removed", f"{rec['kind']}-{rec['name']}-{time.strftime('%Y%m%d-%H%M%S')}")
+    os.makedirs(os.path.dirname(backup), exist_ok=True)
+    if os.path.exists(p):
+        shutil.move(p, backup)
+    keys = home.keys()
+    unbound = []
+    for k in rec.get("keys", []):
+        if keys.get(k["section"], {}).get(k["key"]) == k["action"]:
+            del keys[k["section"]][k["key"]]
+            unbound.append(k)
+    if unbound:
+        home.save_keys(keys)
+    del packages[f"{rec['kind']}:{rec['name']}"]
+    home.save(packages)
+    home.log("remove", kind=rec["kind"], name=rec["name"], source=rec["source"], kept_in=backup)
+    return {"ok": True, "kind": rec["kind"], "name": rec["name"], "moved_to": backup, "keys_unbound": unbound}
 
 
 # ---------------------------------------------------------------- output
@@ -449,6 +791,46 @@ def show(command, result):
                 if i["modified"]:
                     print(f"     modified here: {', '.join(i['modified'])} (an update merges your changes)")
         print(f"\n{n} update(s)")
+    elif command == "update":
+        for i in result["items"]:
+            st = i["status"]
+            head = f"{i['kind']} {i['name']}"
+            if st == "current":
+                print(f"✅ {head}: up to date")
+            elif st == "updated" or st == "would update":
+                m = f"; merged your changes into {', '.join(i['merged'])}" if i["merged"] else ""
+                print(f"⬆️  {head}: {st} {s(i['from'])} → {s(i['to'])} ({i['date']}) {i['subject']}{m}")
+            elif st == "conflict":
+                print(f"⚠️  {head}: not updated, your changes conflict with upstream in {', '.join(i['conflicts'])}")
+                print(f"     merged files with conflict markers: {i['conflicts_dir']}")
+            else:
+                print(f"❌ {head}: {st}: {i.get('reason', '')}")
+    elif command == "install":
+        rv = result.get("review")
+        if rv:
+            print(f"{rv['source']}{'/' + rv['subdir'] if rv['subdir'] else ''} @ {s(rv['commit'])}")
+            for m in rv["mods"]:
+                print(f"  mod {m['name']}: {len(m['files'])} files")
+                for label, files in sorted(m["risks"].items()):
+                    print(f"    {label}: {', '.join(files)}")
+            for lay in rv["layouts"]:
+                print(f"  layout {lay['name']}")
+            for k in rv["keys"]:
+                t = f" (taken by {k['taken_by']}: won't be bound)" if k["taken_by"] else ""
+                print(f"  key {k['key']} → {k['action']}{t}")
+            if not rv["has_recipe"]:
+                print("  no RECIPE.md")
+        if not result["ok"]:
+            print(f"❌ {result['reason']}")
+        elif result.get("installed"):
+            print("✅ installed: " + ", ".join(f"{i['kind']} {i['name']}" for i in result["items"]))
+        else:
+            print(f"→ {result['next']}")
+    elif command == "remove":
+        if result["ok"]:
+            print(f"✅ removed {result['kind']} {result['name']} (kept a copy in {result['moved_to']})")
+        else:
+            print(f"❌ {result['reason']}")
 
 
 def main(argv=None, home=None, gh=None):
@@ -462,13 +844,25 @@ def main(argv=None, home=None, gh=None):
     a.add_argument("--from", dest="source")
     a.add_argument("--dry-run", action="store_true")
     sub.add_parser("outdated")
+    u = sub.add_parser("update")
+    u.add_argument("names", nargs="*")
+    u.add_argument("--dry-run", action="store_true")
+    i = sub.add_parser("install")
+    i.add_argument("source")
+    i.add_argument("--ref")
+    i.add_argument("--yes", "-y", action="store_true")
+    r = sub.add_parser("remove")
+    r.add_argument("name")
+    r.add_argument("--kind", choices=["mod", "layout"])
+    r.add_argument("--force", action="store_true")
     args = ap.parse_args(argv)
     home = home or Home()
     if args.command == "adopt" and args.source and len(args.names) != 1:
         ap.error("--from needs exactly one NAME")
     gh = gh or GitHub(os.path.join(home.data, "cache"))
     result = {"list": lambda: cmd_list(home, args), "adopt": lambda: cmd_adopt(home, args, gh),
-              "outdated": lambda: cmd_outdated(home, args, gh)}[args.command]()
+              "outdated": lambda: cmd_outdated(home, args, gh), "update": lambda: cmd_update(home, args, gh),
+              "install": lambda: cmd_install(home, args, gh), "remove": lambda: cmd_remove(home, args)}[args.command]()
     if args.json:
         print(json.dumps(result, indent=2))
     else:
