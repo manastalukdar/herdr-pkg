@@ -22,7 +22,7 @@ python3 herdr-pkg/scripts/install.py
 
 It copies `mods/pkg` (after `herdr-app check`), binds **Alt+Shift+P** to the Packages dialog (unless that key is already yours), and runs `pkg.py adopt` once to match what you already have to its repos. `--no-adopt` skips that; `--uninstall` takes the mod and the key out again (what it tracks in `data/pkg/` stays). After that it updates itself: `pkg.py update pkg`.
 
-Needs Python 3.8+ (standard library only) and `git`. With [`gh`](https://cli.github.com) logged in it uses your GitHub API quota (5,000 calls an hour); without it, the anonymous API (60 an hour; `GITHUB_TOKEN` raises that). Linux, macOS and Windows paths are handled; it's been tested on Linux.
+Needs Python 3.8+ (standard library only) and `git`. With [`gh`](https://cli.github.com) logged in it uses your GitHub API quota (5,000 calls an hour); without it, the anonymous API (60 an hour; `GITHUB_TOKEN` raises that). Tested on Linux (Fedora 44, Herdr app 0.1.11). macOS should work as is (Python, git, no Linux-only calls) but is untested; on Windows the dialog calls `python3`, which may need to be `python` ([issues](../../issues)).
 
 ## Use it
 
