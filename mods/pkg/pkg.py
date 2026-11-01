@@ -10,6 +10,7 @@
   pkg.py install OWNER/REPO[/SUBDIR] [--ref REF] [--yes]
                               review what a mod/layout package does; with --yes, install it
   pkg.py remove NAME [--kind mod|layout] [--force]
+  pkg.py browse [QUERY]       herdr.dev's mods and layouts, one row per package
 
 Add --json for machine-readable output (the dialog uses it). Standard library only (Python
 3.8+); talks to GitHub through `gh api` when it's logged in, else the REST API (GITHUB_TOKEN
@@ -237,7 +238,8 @@ class GitHub:
             out = []
             for page in range(1, 4):
                 r = self._get(f"search/repositories?q=topic:{topic}&per_page=100&page={page}")
-                out += [{"repo": i["full_name"], "stars": i["stargazers_count"], "branch": i["default_branch"]}
+                out += [{"repo": i["full_name"], "stars": i["stargazers_count"], "branch": i["default_branch"],
+                         "description": i.get("description") or "", "pushed": (i.get("pushed_at") or "")[:10]}
                         for i in r["items"]]
                 if len(r["items"]) < 100:
                     break
@@ -261,7 +263,8 @@ class GitHub:
                     tree = self.branch_tree(r["repo"], r.get("branch") or "HEAD")
                 except LookupError:
                     return r["repo"], None
-                entry = {"stars": r["stars"], "mod": {}, "layout": {}}
+                entry = {"stars": r["stars"], "description": r.get("description", ""), "pushed": r.get("pushed", ""),
+                         "mod": {}, "layout": {}}
                 for path in tree:
                     m = re.match(r"((?:.+/)?mods/([^/]+))/", path)
                     if m:
@@ -706,6 +709,36 @@ def cmd_install(home, args, gh):
             "keys_bound": bound, "skipped_keys": [k for k in review["keys"] if k["taken_by"]]}
 
 
+def cmd_browse(home, args, gh):
+    """One row per package (a repo, or a folder of one that holds mods/ or layouts/)."""
+    packages, inst = home.load(), {(k, n) for k, n in home.inventory()}
+    rows = {}
+    for repo, e in gh.index().items():
+        for kind in ("mod", "layout"):
+            for name, paths in e.get(kind, {}).items():
+                for path in paths:
+                    sub = path.rsplit("/mods/", 1)[0] if "/mods/" in "/" + path and kind == "mod" else ""
+                    if kind == "mod" and path.startswith("mods/"):
+                        sub = ""
+                    if kind == "layout":
+                        sub = path.rsplit("layouts/", 1)[0].rstrip("/")
+                    row = rows.setdefault((repo, sub), {"repo": repo, "subdir": sub, "stars": e["stars"],
+                                                        "description": e.get("description", ""), "pushed": e.get("pushed", ""),
+                                                        "mods": [], "layouts": [], "installed": []})
+                    row[kind + "s"].append(name)
+                    rec = packages.get(f"{kind}:{name}")
+                    if rec and rec["source"] == repo:
+                        row["installed"].append(f"{kind}:{name}")
+                    elif (kind, name) in inst and not rec:
+                        row.setdefault("same_name", []).append(f"{kind}:{name}")
+    q = (args.query or "").lower()
+    out = [r for r in rows.values() if not q or q in " ".join([r["repo"], r["description"], *r["mods"], *r["layouts"]]).lower()]
+    for r in out:
+        r["mods"].sort()
+        r["layouts"].sort()
+    return {"packages": sorted(out, key=lambda r: (-r["stars"], r["repo"], r["subdir"]))}
+
+
 def cmd_remove(home, args):
     packages = home.load()
     hits = [r for r in packages.values() if r["name"] == args.name and (not args.kind or r["kind"] == args.kind)]
@@ -826,6 +859,13 @@ def show(command, result):
             print("✅ installed: " + ", ".join(f"{i['kind']} {i['name']}" for i in result["items"]))
         else:
             print(f"→ {result['next']}")
+    elif command == "browse":
+        for r in result["packages"]:
+            where = r["repo"] + ("/" + r["subdir"] if r["subdir"] else "")
+            what = "; ".join(x for x in [("mods: " + ", ".join(r["mods"])) if r["mods"] else "",
+                                         ("layouts: " + ", ".join(r["layouts"])) if r["layouts"] else ""] if x)
+            mark = " ✓" if r["installed"] else ""
+            print(f"★{r['stars']:<4} {where}{mark}\n       {what}")
     elif command == "remove":
         if result["ok"]:
             print(f"✅ removed {result['kind']} {result['name']} (kept a copy in {result['moved_to']})")
@@ -851,6 +891,8 @@ def main(argv=None, home=None, gh=None):
     i.add_argument("source")
     i.add_argument("--ref")
     i.add_argument("--yes", "-y", action="store_true")
+    b = sub.add_parser("browse")
+    b.add_argument("query", nargs="?")
     r = sub.add_parser("remove")
     r.add_argument("name")
     r.add_argument("--kind", choices=["mod", "layout"])
@@ -862,7 +904,8 @@ def main(argv=None, home=None, gh=None):
     gh = gh or GitHub(os.path.join(home.data, "cache"))
     result = {"list": lambda: cmd_list(home, args), "adopt": lambda: cmd_adopt(home, args, gh),
               "outdated": lambda: cmd_outdated(home, args, gh), "update": lambda: cmd_update(home, args, gh),
-              "install": lambda: cmd_install(home, args, gh), "remove": lambda: cmd_remove(home, args)}[args.command]()
+              "install": lambda: cmd_install(home, args, gh), "remove": lambda: cmd_remove(home, args),
+              "browse": lambda: cmd_browse(home, args, gh)}[args.command]()
     if args.json:
         print(json.dumps(result, indent=2))
     else:

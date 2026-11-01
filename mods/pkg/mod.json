@@ -1,0 +1,5 @@
+{
+  "place": "none",
+  "title": "Packages",
+  "overlay": { "kind": "dialog", "width": 0.8, "height": 0.8 }
+}
