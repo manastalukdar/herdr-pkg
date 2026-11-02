@@ -303,6 +303,25 @@ class PkgTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("// mine", self.read("mods/stats/main.js"))
 
+    def test_install_as_another_name_then_update(self):
+        # Issue #4: yours is called stats too; the new one goes in as stats2, and stays stats2.
+        write(os.path.join(self.up, "ex", "keys.json"), json.dumps({"global": {"alt-s": "mod.open:stats"}}))
+        write(os.path.join(self.up, "ex", "layouts", "board.json"), '{"content": {"mod": "stats"}}\n')
+        self.commit_upstream("ex/mods/stats/main.js", "const icon = 'mods/stats/icon.png';\n", "icon")
+        self.install("stats", "mine")
+        r = self.run_cmd("install", "o/examples/ex", "--as", "stats2", "--yes")
+        self.assertEqual([(i["kind"], i["name"]) for i in r["items"]], [("mod", "stats2"), ("layout", "board")])
+        self.assertIn("// mine", self.read("mods/stats/main.js"))
+        self.assertEqual(self.read("mods/stats2/main.js"), "const icon = 'mods/stats2/icon.png';\n")
+        self.assertEqual(self.read("layouts/board.json"), '{"content": {"mod": "stats2"}}\n')
+        self.assertEqual(json.loads(self.read("keys.json"))["global"], {"alt-s": "mod.open:stats2"})
+        self.assertEqual({i["status"] for i in self.run_cmd("outdated")["items"]}, {"current"})
+        self.commit_upstream("ex/mods/stats/main.js", "const icon = 'mods/stats/icon2.png';\n", "icon2")
+        r = self.run_cmd("update")["items"]
+        self.assertEqual([(i["name"], i["status"]) for i in r], [("board", "current"), ("stats2", "updated")])
+        self.assertEqual(self.read("mods/stats2/main.js"), "const icon = 'mods/stats2/icon2.png';\n")
+        self.assertEqual(self.home.load()["mod:stats2"]["modified"], [])
+
     def test_install_rolls_back_when_check_fails(self):
         self.check_ok = False
         self.assertFalse(self.run_cmd("install", "o/examples/ex", "--yes")["ok"])

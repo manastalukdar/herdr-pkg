@@ -29,7 +29,7 @@ Needs Python 3.8+ (standard library only) and `git`. With [`gh`](https://cli.git
 **Alt+Shift+P** opens the Packages dialog:
 
 - **Installed**: your mods and layouts, each with where it came from, the commit installed and a status: up to date, update (with the newest commit's message), modified (differs from upstream here), clone (a copy of one of Herdr's own, which only you maintain), personal, or untracked. Buttons per row: Update, Adopt, Repo, Remove (click twice). Update all and Adopt all at the top.
-- **Browse**: every package herdr.dev lists (GitHub topics `herdr-mod` and `herdr-layout`), one row per package with its mods and layouts named, searchable. Review shows what a package adds, what its code does (runs programs, uses the network, reads or writes files), the keys it binds and any it can't because you use them; Install installs it.
+- **Browse**: every package herdr.dev lists (GitHub topics `herdr-mod` and `herdr-layout`), one row per package with its mods and layouts named, searchable. Review shows what a package adds, what its code does (runs programs, uses the network, reads or writes files), the keys it binds and any it can't because you use them; Install installs it. When its one mod has a name you already use, Review as `<name>-2` offers it under that name.
 
 Everything the dialog does is also a command:
 
@@ -39,6 +39,7 @@ python3 $P list                                   # what's installed, mods and l
 python3 $P outdated                               # which have updates (changes nothing)
 python3 $P update [NAME...]                       # update; your local edits are merged in
 python3 $P install OWNER/REPO[/FOLDER] [--yes]    # review, then install with --yes
+      ... [--as NAME]                             # its one mod under another name
 python3 $P remove NAME [--kind mod|layout]        # a copy goes to data/pkg/removed/
 python3 $P adopt [NAME...] [--from OWNER/REPO]    # track things installed before herdr-pkg
 python3 $P browse [QUERY]                         # herdr.dev's packages
@@ -61,7 +62,7 @@ Add `--json` for output a script (or the dialog) can read.
 - **Records.** `~/.config/herdr-app/data/pkg/packages.json` holds one record per mod or layout: the repo, the folder in it, the commit installed, the git blob hash of every file as installed, and the keys it bound. `log.jsonl` next to it lists every install, update, adopt and remove.
 - **Adopting** (things installed before herdr-pkg). It hashes your files the way git does and compares them with the repos herdr.dev lists that have a package of that name (one tree per repo, fetched eight at a time and cached for a day), walking back through the commits that changed that folder until the files match. No match on every file means you changed it: it's recorded on the commit closest to your copy (most files equal, then most lines in common), marked modified, so updates merge into your changes rather than replace them. Copies of Herdr's own mods that nobody published are listed as clones and left alone. A repo herdr.dev doesn't list: `adopt NAME --from OWNER/REPO`.
 - **Updating.** Each file is merged three ways with `git merge-file`: the installed commit's version, yours, and the new one. Files you didn't touch take upstream's; files only you changed stay yours; files both changed merge, and if that conflicts nothing is written: the merged files with conflict markers go to `data/pkg/conflicts/<name>/`. The row shows **conflict** until upstream moves on or a retry succeeds. A copy changed outside pkg (say, by a mod's own installer) that equals some upstream commit is re-based onto that commit first, so it doesn't conflict with itself. The new folder is staged next to the old one and swapped in; if `herdr-app check` then fails, the old one goes back. Files Herdr generates (`*.d.ts`, `jsconfig.json`) and an installer's `runtime.json` are left out of every comparison.
-- **Installing** never overwrites: a mod or layout name you already have stops it. It shows the scan first; the scan is a text match, so it can over-report, and it can't prove a package is safe.
+- **Installing** never overwrites: a mod or layout name you already have stops it. `--as NAME` installs a package's one mod under another name, renamed the way AGENTS.md says: its folder, its own `mods/<name>/` paths, the `"mod": "<name>"` in the package's layouts, and `mod.open:<name>` in its keys. The record keeps both names, and updates rewrite upstream's files the same way before comparing and merging, so a renamed mod updates like any other. It shows the scan first; the scan is a text match, so it can over-report, and it can't prove a package is safe.
 - **No background work.** It checks for updates when you open the dialog (or run `outdated`); nothing runs otherwise.
 
 ## Development

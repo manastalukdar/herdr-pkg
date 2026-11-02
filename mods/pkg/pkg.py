@@ -9,6 +9,7 @@
   pkg.py update [NAME...]     update them; your local edits are merged in (three-way)
   pkg.py install OWNER/REPO[/SUBDIR] [--ref REF] [--yes]
                               review what a mod/layout package does; with --yes, install it
+        [--as NAME]           ...its one mod under another name (when yours has its name)
   pkg.py remove NAME [--kind mod|layout] [--force]
   pkg.py browse [QUERY]       herdr.dev's mods and layouts, one row per package
 
@@ -281,6 +282,42 @@ class GitHub:
         return self._cached("index.json", DAY, fetch)
 
 
+def rename(data, old, new):
+    """Bytes with mod `old` called `new`, as AGENTS.md says to rename one: its `mods/<name>/` paths,
+    the `"mod": "<name>"` in layouts, and `mod.open:<name>` in keys."""
+    return re.sub(rb'(mods/|"mod"\s*:\s*"|mod\.open:)' + re.escape(old.encode()) + rb'(?![\w.-])',
+                  lambda m: m.group(1) + new.encode(), data)
+
+
+class Renamed:
+    """`gh` as seen by a record installed under another name (`renamed: [old, new]`): the package's
+    upstream files come rewritten the same way, with their shas, so they compare and merge with
+    the installed copy like any other package's."""
+
+    def __init__(self, gh, rec):
+        self.gh, self.path, (self.old, self.new), self.data = gh, rec["path"], rec["renamed"], {}
+
+    def __getattr__(self, attr):
+        return getattr(self.gh, attr)
+
+    def tree(self, repo, commit):
+        out = dict(self.gh.tree(repo, commit))
+        for p, sha in out.items():
+            if p == self.path or p.startswith(self.path + "/"):
+                data = rename(self.gh.blob(repo, sha), self.old, self.new)
+                out[p] = blob_sha(data)
+                self.data[out[p]] = data
+        return out
+
+    def blob(self, repo, sha):
+        return self.data[sha] if sha in self.data else self.gh.blob(repo, sha)
+
+
+def upstream(gh, rec):
+    """Where a record's upstream files come from: the one place its rename is applied."""
+    return Renamed(gh, rec) if rec.get("renamed") else gh
+
+
 def _which(cmd):
     return any(os.access(os.path.join(d, cmd), os.X_OK) for d in os.environ.get("PATH", "").split(os.pathsep))
 
@@ -484,6 +521,7 @@ def rebase(home, gh, rec):
 def cmd_outdated(home, args, gh):
     out = []
     for key, rec in sorted(home.load().items()):
+        up = upstream(gh, rec)
         try:
             sha, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
         except (LookupError, IndexError) as e:
@@ -491,10 +529,10 @@ def cmd_outdated(home, args, gh):
             continue
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "installed": rec["commit"],
                 "latest": sha, "date": date, "subject": subject, "modified": rec.get("modified", [])}
-        rebase(home, gh, rec)  # not saved here; the next update saves it
+        rebase(home, up, rec)  # not saved here; the next update saves it
         item["installed"] = rec["commit"]
         c = rec.get("conflict", {})
-        item["status"] = "current" if same_files(gh, rec, sha) else "conflict" if c.get("to") == sha else "update"
+        item["status"] = "current" if same_files(up, rec, sha) else "conflict" if c.get("to") == sha else "update"
         if item["status"] == "conflict":
             item.update(conflicts=c["files"], conflicts_dir=c["dir"])
         out.append(item)
@@ -595,15 +633,16 @@ def cmd_update(home, args, gh):
         if names and rec["name"] not in names:
             continue
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "from": rec["commit"]}
+        up = upstream(gh, rec)
         try:
             latest, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
-            if rebase(home, gh, rec):
+            if rebase(home, up, rec):
                 item["from"] = rec["commit"]
-            if same_files(gh, rec, latest):
+            if same_files(up, rec, latest):
                 rec.pop("conflict", None)
                 out.append({**item, "status": "current"})
                 continue
-            writes, conflicts, merged = plan_update(home, gh, rec, latest)
+            writes, conflicts, merged = plan_update(home, up, rec, latest)
         except (LookupError, IndexError) as e:
             out.append({**item, "status": "error", "reason": str(e)})
             continue
@@ -628,7 +667,7 @@ def cmd_update(home, args, gh):
             out.append({**item, "status": "check failed, rolled back", "reason": check})
             home.log("rollback", kind=rec["kind"], name=rec["name"], to=latest)
             continue
-        theirs = files_at(gh.tree(rec["source"], latest), rec["kind"], rec["path"])
+        theirs = files_at(up.tree(rec["source"], latest), rec["kind"], rec["path"])
         rec.pop("conflict", None)
         rec.update(commit=latest, files=home.files(rec["kind"], rec["name"]),
                    modified=compare(home.files(rec["kind"], rec["name"]), theirs)[1], at=time.strftime("%Y-%m-%d"))
@@ -668,7 +707,17 @@ def cmd_install(home, args, gh):
         where = ", ".join(p or "(root)" for p in pkgf["prefixes"]) or "none"
         return {"ok": False, "reason": f"no mods/ or layouts/ at {sub or 'the repo root'}; packages in this repo: {where}"}
     base, packages, keys = pkgf["base"], home.load(), home.keys()
-    review = {"source": repo, "subdir": sub, "commit": commit, "mods": [], "layouts": [], "keys": [], "clashes": []}
+    renamed = None
+    if args.as_name:
+        if len(pkgf["mods"]) != 1:
+            return {"ok": False, "reason": f"--as renames a package's one mod; this one has {len(pkgf['mods'])}"}
+        if not re.fullmatch(r"[\w-][\w.-]*", args.as_name):
+            return {"ok": False, "reason": f"--as {args.as_name}: letters, digits, '-', '_' and '.' only"}
+        renamed = [pkgf["mods"][0], args.as_name]
+    named = lambda m: renamed[1] if renamed else m  # noqa: E731
+    blob = lambda sha: rename(gh.blob(repo, sha), *renamed) if renamed else gh.blob(repo, sha)  # noqa: E731
+    review = {"source": repo, "subdir": sub, "commit": commit, "mods": [], "layouts": [], "keys": [], "clashes": [],
+              "renamed": renamed}
     for m in pkgf["mods"]:
         files = files_at(tree, "mod", f"{base}mods/{m}")
         risks = {}
@@ -678,15 +727,15 @@ def cmd_install(home, args, gh):
                 for label, rx in RISKS:
                     if rx.search(text):
                         risks.setdefault(label, []).append(rel)
-        review["mods"].append({"name": m, "files": sorted(files), "risks": risks})
-        if os.path.exists(home.path("mod", m)) or m in home.shipped:
-            review["clashes"].append(f"mod {m} already exists")
+        review["mods"].append({"name": named(m), "files": sorted(files), "risks": risks})
+        if os.path.exists(home.path("mod", named(m))) or named(m) in home.shipped:
+            review["clashes"].append(f"mod {named(m)} already exists")
     for lay in pkgf["layouts"]:
         review["layouts"].append({"name": lay})
         if os.path.exists(home.path("layout", lay)) or f"layout:{lay}" in home.shipped:
             review["clashes"].append(f"layout {lay} already exists")
     if pkgf["keys"]:
-        theirs = json.loads(gh.blob(repo, tree[base + "keys.json"]))
+        theirs = json.loads(blob(tree[base + "keys.json"]))
         for section, binds in theirs.items():
             for k, action in binds.items():
                 have = keys.get(section, {}).get(k)
@@ -695,25 +744,25 @@ def cmd_install(home, args, gh):
     review["has_recipe"] = (base + "RECIPE.md") in tree
     review["has_preview"] = (base + "preview.png") in tree
     if review["clashes"]:
-        return {"ok": False, "review": review, "reason": "name clash: remove or rename yours first (installing never overwrites)"}
+        return {"ok": False, "review": review, "reason": "name clash: remove or rename yours, or install the new mod --as another name (installing never overwrites)"}
     if not args.yes:
         return {"ok": True, "review": review, "installed": False, "next": "run again with --yes to install"}
     done = []
     for m in pkgf["mods"]:
         files = files_at(tree, "mod", f"{base}mods/{m}")
-        ok, check = apply_files(home, "mod", m, {rel: gh.blob(repo, sha) for rel, sha in files.items()}, fresh=True)
+        ok, check = apply_files(home, "mod", named(m), {rel: blob(sha) for rel, sha in files.items()}, fresh=True)
         if not ok:
-            shutil.rmtree(home.path("mod", m), ignore_errors=True)
+            shutil.rmtree(home.path("mod", named(m)), ignore_errors=True)
             for k, n in done:
                 if k == "mod":
                     shutil.rmtree(home.path("mod", n), ignore_errors=True)
                 else:
                     os.remove(home.path("layout", n))
-            return {"ok": False, "review": review, "reason": f"herdr-app check failed for {m}: {check}"}
-        done.append(("mod", m))
+            return {"ok": False, "review": review, "reason": f"herdr-app check failed for {named(m)}: {check}"}
+        done.append(("mod", named(m)))
     for lay in pkgf["layouts"]:
         path = f"{base}layouts/{lay}.json"
-        apply_files(home, "layout", lay, {lay + ".json": gh.blob(repo, tree[path])})
+        apply_files(home, "layout", lay, {lay + ".json": blob(tree[path])})
         done.append(("layout", lay))
     bound = []
     for k in review["keys"]:
@@ -723,10 +772,12 @@ def cmd_install(home, args, gh):
     if bound:
         home.save_keys(keys)
     for kind, n in done:
-        path = f"{base}mods/{n}" if kind == "mod" else f"{base}layouts/{n}.json"
+        path = f"{base}mods/{pkgf['mods'][0] if renamed else n}" if kind == "mod" else f"{base}layouts/{n}.json"
         packages[f"{kind}:{n}"] = {"kind": kind, "name": n, "source": repo, "path": path, "commit": commit,
                                    "modified": [], "files": home.files(kind, n), "adopted": False,
                                    "keys": [k for k in bound], "at": time.strftime("%Y-%m-%d")}
+        if renamed:
+            packages[f"{kind}:{n}"]["renamed"] = renamed
         home.log("install", kind=kind, name=n, source=repo, commit=commit)
     home.save(packages)
     return {"ok": True, "review": review, "installed": True, "items": [{"kind": k, "name": n} for k, n in done],
@@ -868,6 +919,8 @@ def show(command, result):
         rv = result.get("review")
         if rv:
             print(f"{rv['source']}{'/' + rv['subdir'] if rv['subdir'] else ''} @ {s(rv['commit'])}")
+            if rv.get("renamed"):
+                print(f"  mod {rv['renamed'][0]} installs as {rv['renamed'][1]}")
             for m in rv["mods"]:
                 print(f"  mod {m['name']}: {len(m['files'])} files")
                 for label, files in sorted(m["risks"].items()):
@@ -917,6 +970,7 @@ def main(argv=None, home=None, gh=None):
     i.add_argument("source")
     i.add_argument("--ref")
     i.add_argument("--yes", "-y", action="store_true")
+    i.add_argument("--as", dest="as_name", metavar="NAME")
     b = sub.add_parser("browse")
     b.add_argument("query", nargs="?")
     r = sub.add_parser("remove")
