@@ -331,11 +331,11 @@ export default class Pkg extends View {
   barView(t) {
     const n = this.waiting.length;
     const conflict = this.waiting.some((i) => i.status === "conflict");
+    // Always shown (an empty block reads as "not installed"): dim "pkg" when all is current.
     return h_flex().id("pkg-bar").size_full().px(8).items_center().justify_center().bg(t.chrome).text_size(12)
-      .when(n > 0, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover))
-        .on_click(() => run("mod.open", { name: "pkg" }))
-        .child(div().text_color(conflict ? t.ansi1 : t.blocked)
-          .child(`↑ ${n}`)));
+      .cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_click(() => run("mod.open", { name: "pkg" }))
+      .child(div().text_color(n ? (conflict ? t.ansi1 : t.blocked) : t.dim).child(n ? `↑ ${n}` : "pkg"));
   }
 
   render(_cx) {

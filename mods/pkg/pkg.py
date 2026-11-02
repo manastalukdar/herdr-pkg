@@ -21,6 +21,7 @@ import argparse
 import base64
 import contextlib
 import difflib
+import filecmp
 import hashlib
 import json
 import os
@@ -627,9 +628,33 @@ def plan_update(home, gh, rec, latest):
     return writes, conflicts, merged
 
 
+def sync_into(src, dst):
+    """Make folder `dst` hold exactly `src`'s files by writing inside it. Replacing the folder
+    itself (a rename over it) leaves Herdr's hot reload watching the old one, so the mod would
+    keep running its old code until the layout restarts. Unchanged files aren't touched."""
+    keep = set()
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        os.makedirs(os.path.join(dst, rel), exist_ok=True)
+        for f in files:
+            r = os.path.normpath(os.path.join(rel, f))
+            keep.add(r)
+            a, b = os.path.join(src, r), os.path.join(dst, r)
+            if not (os.path.isfile(b) and filecmp.cmp(a, b, shallow=False)):
+                shutil.copy2(a, b)
+    for root, _dirs, files in os.walk(dst, topdown=False):
+        rel = os.path.relpath(root, dst)
+        for f in files:
+            if os.path.normpath(os.path.join(rel, f)) not in keep:
+                os.remove(os.path.join(root, f))
+        if rel != "." and not os.path.isdir(os.path.join(src, rel)) and not os.listdir(root):
+            os.rmdir(root)
+
+
 def apply_files(home, kind, name, writes, fresh=False):
-    """Write `writes` into the mod folder / layout file, through a staged copy and a swap; on a failed
-    `herdr-app check` the old one is put back. Returns (ok, check output)."""
+    """Write `writes` into the mod folder / layout file. A mod is built in a staged copy (outside
+    mods/, where Herdr would load it) and `herdr-app check`ed there; only a passing one is copied
+    in, in place (see sync_into), after a backup. Returns (ok, check output)."""
     dest = home.path(kind, name)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = os.path.join(home.data, "backup", f"{kind}-{name}-{stamp}")
@@ -644,7 +669,7 @@ def apply_files(home, kind, name, writes, fresh=False):
             f.write(data)
         os.replace(tmp, dest)
         return True, ""
-    stage = dest + ".pkg-new"
+    stage = os.path.join(home.data, "stage", name)  # same folder name: a mod may look itself up by it
     rmtree(stage)
     if os.path.isdir(dest) and not fresh:
         shutil.copytree(dest, stage, symlinks=True)
@@ -659,14 +684,12 @@ def apply_files(home, kind, name, writes, fresh=False):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "wb") as f:
             f.write(data)
-    if os.path.isdir(dest):
-        os.replace(dest, backup)
-    os.replace(stage, dest)
-    ok, out = home.check(dest)
-    if not ok:
-        rmtree(dest)
-        if os.path.isdir(backup):
-            os.replace(backup, dest)
+    ok, out = home.check(stage)
+    if ok:
+        if os.path.isdir(dest):
+            shutil.copytree(dest, backup, symlinks=True)
+        sync_into(stage, dest)
+    rmtree(stage)
     return ok, out
 
 

@@ -17,6 +17,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 KEY, ACTION = "alt-shift-p", "mod.open:pkg"
+GENERATED = ("*.d.ts", "jsconfig.json")
+sys.path.insert(0, str(REPO / "mods" / "pkg"))
+from pkg import sync_into  # noqa: E402
 BAR = {"id": "pkg-bar", "type": "block", "content": {"mod": "pkg", "props": {"bar": True}}, "size": {"px": 44}}
 STATUS = "workspace-status"
 
@@ -110,17 +113,21 @@ def main():
         sys.exit("mods/pkg already exists. Use --update, or `pkg.py update pkg` once it's tracked.")
     if dest.exists() and (home / "installed.json").exists() and "pkg" in json.loads((home / "installed.json").read_text(encoding="utf-8")):
         sys.exit("Herdr has a mod of its own called pkg; not overwriting it.")
-    tmp = home / "mods" / "pkg.install-tmp"
+    # Staged outside mods/ (Herdr would load a folder there), checked, then copied in place:
+    # replacing mods/pkg itself would leave Herdr's hot reload watching the old folder.
+    tmp = home / "data" / "pkg" / "stage" / "pkg"
     shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(REPO / "mods" / "pkg", tmp, ignore=shutil.ignore_patterns("__pycache__", "*.d.ts", "jsconfig.json"))
+    shutil.copytree(REPO / "mods" / "pkg", tmp, ignore=shutil.ignore_patterns("__pycache__", *GENERATED))
+    for g in GENERATED:  # Herdr's own, written for this version: keep them
+        for f in dest.glob(g) if dest.exists() else []:
+            shutil.copy2(f, tmp / f.name)
     if shutil.which("herdr-app"):
         r = subprocess.run(["herdr-app", "check", str(tmp)], capture_output=True, text=True)
         if r.returncode:
             shutil.rmtree(tmp)
             sys.exit(f"herdr-app check failed:\n{r.stdout}{r.stderr}")
-    if dest.exists():
-        shutil.rmtree(dest)
-    tmp.rename(dest)
+    sync_into(str(tmp), str(dest))
+    shutil.rmtree(tmp)
     print(f"{'updated' if a.update else 'copied'} mods/pkg")
     if a.update:
         return

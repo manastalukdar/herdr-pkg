@@ -217,6 +217,18 @@ class PkgTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.home_dir, "mods", "stats", "gpui-kit.d.ts")))  # generated files kept
         self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "current")
 
+    def test_update_writes_into_the_same_folder(self):
+        # Herdr's hot reload watches the folder: swapping it for a new one leaves the old code running.
+        self.install("stats", "v2")
+        self.run_cmd("adopt")
+        d = os.path.join(self.home_dir, "mods", "stats")
+        write(os.path.join(d, "mine.js"), "yours")  # a file only you have: kept
+        inode = os.stat(d).st_ino
+        self.run_cmd("update")
+        self.assertEqual(os.stat(d).st_ino, inode)
+        self.assertIn("// v3", self.read("mods/stats/main.js"))
+        self.assertEqual(sorted(os.listdir(os.path.join(self.home_dir, "mods"))), ["stats", "tabs"])  # nothing staged here
+
     def test_update_merges_a_local_patch(self):
         # upstream main.js grows a line at the end; the local copy patched the top
         lines = "".join(f"line {i}\n" for i in range(12))
