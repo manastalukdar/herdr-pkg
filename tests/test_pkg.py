@@ -45,10 +45,13 @@ class FakeGitHub:
                 out[path] = sha
         return out
 
-    def history(self, repo, path, limit=pkg.HISTORY):
+    def history(self, repo, path, limit=pkg.HISTORY, ref=None):
         self.calls += 1
-        log = git(self.repos[repo], "log", f"-{limit}", "--format=%H %cs %s", "--", path)
+        log = git(self.repos[repo], "log", f"-{limit}", "--format=%H %cs %s", ref or "HEAD", "--", path)
         return [tuple(line.split(" ", 2)) for line in log.splitlines()]
+
+    def is_branch(self, repo, ref):
+        return subprocess.run(["git", "-C", self.repos[repo], "show-ref", "-q", "--verify", "refs/heads/" + ref]).returncode == 0
 
     def topic(self, topic):
         return self.topics.get(topic, [])
@@ -271,6 +274,42 @@ class PkgTest(unittest.TestCase):
         self.assertEqual(r["status"], "check failed, rolled back")
         self.assertIn("// v2", self.read("mods/stats/main.js"))
         self.assertEqual(self.home.load()["mod:stats"]["commit"], self.commits[1])
+
+    # ---- pin
+
+    def test_pin_stops_update_and_unpin_resumes(self):
+        self.install("stats", "v2")
+        self.run_cmd("adopt")
+        self.assertEqual(self.run_cmd("pin", "stats")["pin"], self.commits[1])  # no ref: the installed commit
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "pinned")
+        self.assertEqual(self.run_cmd("update")["items"][0]["status"], "pinned")
+        self.assertIn("// v2", self.read("mods/stats/main.js"))
+        self.run_cmd("unpin", "stats")
+        self.assertEqual(self.run_cmd("update")["items"][0]["to"], self.commits[2])
+
+    def test_pin_to_a_tag_moves_there_once(self):
+        git(self.up, "tag", "v1", self.commits[0])
+        self.install("stats", "v3")
+        self.run_cmd("adopt")
+        self.assertEqual(self.run_cmd("pin", "stats", "v1")["pin"], "v1")
+        self.assertEqual(self.run_cmd("update")["items"][0]["to"], self.commits[0])
+        self.commit_upstream("ex/mods/stats/main.js", "// v4\n", "v4")
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "pinned")
+
+    def test_install_ref_branch_follows_that_branch(self):
+        git(self.up, "checkout", "-q", "-b", "dev")
+        dev = self.commit_upstream("ex/mods/stats/main.js", "// dev 1\n", "dev 1")
+        git(self.up, "checkout", "-q", "main")
+        self.run_cmd("install", "o/examples/ex", "--ref", "dev", "--yes")
+        self.assertEqual(self.home.load()["mod:stats"]["branch"], "dev")
+        self.commit_upstream("ex/mods/stats/main.js", "// main 4\n", "main moves")  # not followed
+        self.assertEqual({i["name"]: i["status"] for i in self.run_cmd("outdated")["items"]}, {"stats": "current", "board": "current"})
+        git(self.up, "checkout", "-q", "dev")
+        later = self.commit_upstream("ex/mods/stats/main.js", "// dev 2\n", "dev 2")
+        git(self.up, "checkout", "-q", "main")
+        r = {i["name"]: i for i in self.run_cmd("update")["items"]}["stats"]
+        self.assertEqual((r["status"], r["from"], r["to"]), ("updated", dev, later))
+        self.assertEqual(self.read("mods/stats/main.js"), "// dev 2\n")
 
     # ---- install / remove
 
