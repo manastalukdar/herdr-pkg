@@ -150,19 +150,19 @@ export default class Pkg extends View {
     cx.notify();
   }
 
-  startReview(cx, p) {
+  startReview(cx, p, as) {
     const source = p.repo + (p.subdir ? `/${p.subdir}` : "");
     this.tab = "review";
     this.review = null;
     cx.spawn(async (cx) => this.work(cx, `Reading ${source}…`, async () => {
-      this.review = { source, ...(await this.pkg(["install", source])) };
+      this.review = { source, as, ...(await this.pkg(["install", source, ...(as ? ["--as", as] : [])])) };
     }));
   }
 
   install(cx) {
-    const source = this.review.source;
+    const { source, as } = this.review;
     cx.spawn(async (cx) => this.work(cx, `Installing ${source}…`, async () => {
-      const r = await this.pkg(["install", source, "--yes"]);
+      const r = await this.pkg(["install", source, "--yes", ...(as ? ["--as", as] : [])]);
       if (!r.ok) {
         this.message = r.reason;
         return;
@@ -298,6 +298,8 @@ export default class Pkg extends View {
     }
     if (!r.ok && !rv) blocks.push(block("Can't install", [line(r.reason, t.blocked)]));
     const can = r.ok && rv && !rv.clashes.length && !r.installed;
+    // A clash on the package's one mod (and nothing else): offer it under another name (pkg.py install --as).
+    const as = rv && rv.mods.length === 1 && rv.clashes.length && rv.clashes.every((c) => c.startsWith("mod ")) ? `${rv.mods[0].name}-2` : null;
     return [
       div().text_size(12).text_color(t.dim).child("The scan is a text match: it can over-report, and it can't prove a package is safe. Open the repo to read the code."),
       v_flex().id("review-body").flex_1().min_h(0).gap(14).overflow_y_scrollbar().children(blocks),
@@ -305,7 +307,8 @@ export default class Pkg extends View {
         .child(div().flex_1())
         .child(this.button(t, "rv-repo", "Repo", () => this.openRepo(r.source.split("/").slice(0, 2).join("/"))))
         .child(this.button(t, "rv-back", "Back", (cx) => { this.tab = "browse"; cx.notify(); }))
-        .when(can, (el) => el.child(this.button(t, "rv-install", "Install", (cx) => this.install(cx), true))),
+        .when(can, (el) => el.child(this.button(t, "rv-install", "Install", (cx) => this.install(cx), true)))
+        .when(!!as, (el) => el.child(this.button(t, "rv-as", `Review as ${as}`, (cx) => this.startReview(cx, { repo: r.source }, as), true))),
     ];
   }
 
