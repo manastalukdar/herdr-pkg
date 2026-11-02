@@ -243,6 +243,21 @@ class PkgTest(unittest.TestCase):
         with open(os.path.join(r["conflicts_dir"], "main.js")) as f:
             self.assertIn("<<<<<<<", f.read())
 
+    def test_update_rebases_a_copy_installed_outside_pkg(self):
+        # Issue #6: adopted at v3, then upstream moves main.js into a subfolder and the mod's own
+        # installer copies that layout in; a later upstream change must update, not conflict.
+        self.install("stats", "v3")
+        self.run_cmd("adopt")
+        os.remove(os.path.join(self.up, "ex", "mods", "stats", "main.js"))
+        moved = self.commit_upstream("ex/mods/stats/files/main.js", "// moved\n", "move")
+        d = os.path.join(self.home_dir, "mods", "stats")
+        os.remove(os.path.join(d, "main.js"))
+        write(os.path.join(d, "files", "main.js"), "// moved\n")
+        latest = self.commit_upstream("ex/mods/stats/files/main.js", "// moved v2\n", "change")
+        r = self.run_cmd("update")["items"][0]
+        self.assertEqual((r["status"], r["from"], r["to"]), ("updated", moved, latest))
+        self.assertEqual(self.read("mods/stats/files/main.js"), "// moved v2\n")
+
     def test_update_rolls_back_when_check_fails(self):
         self.install("stats", "v2")
         self.run_cmd("adopt")

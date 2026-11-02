@@ -578,6 +578,15 @@ def cmd_update(home, args, gh):
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "from": rec["commit"]}
         try:
             latest, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
+            now = home.files(rec["kind"], rec["name"])
+            if now != rec.get("files"):
+                # Changed outside pkg (e.g. the mod's own installer): if the copy now equals some
+                # upstream commit exactly, that commit is the real base. A local edit matches none
+                # and keeps the recorded base, so it still merges.
+                found = locate(gh, rec["source"], rec["kind"], rec["name"], now, path=rec["path"])
+                if found and not found["modified"]:
+                    rec.update(commit=found["commit"], files=now, modified=[])
+                    item["from"] = found["commit"]
             if same_files(gh, rec, latest):
                 out.append({**item, "status": "current"})
                 continue

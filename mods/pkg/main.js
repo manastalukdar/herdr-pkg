@@ -98,6 +98,9 @@ export default class Pkg extends View {
         ...bad.map((i) => `${i.name}: ${i.status}${i.conflicts?.length ? ` in ${i.conflicts.join(", ")} (see ${i.conflicts_dir})` : i.reason ? `: ${i.reason}` : ""}`)]
         .filter(Boolean).join(" ") || "Nothing to update.";
       if (done.length) notify({ title: `Updated ${done.length}`, body: done.map((i) => i.name).join("\n"), level: "success" });
+      const conflicted = bad.filter((i) => i.status === "conflict");
+      if (conflicted.length) notify({ title: `Not updated: conflict${conflicted.length > 1 ? "s" : ""}`, level: "warning",
+        body: conflicted.map((i) => `${i.name}: ${i.conflicts.join(", ")}\n${i.conflicts_dir}`).join("\n") });
       await this.refresh(cx);
     }));
   }
