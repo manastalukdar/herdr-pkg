@@ -467,6 +467,20 @@ def same_files(gh, rec, latest):
     return latest == rec["commit"] or t(latest) == t(rec["commit"])
 
 
+def rebase(home, gh, rec):
+    """Re-point `rec` at the upstream commit its installed files now equal exactly, when they were
+    changed outside pkg (e.g. by the mod's own installer). A local edit matches no commit and keeps
+    the recorded base, so it still merges. True when `rec` moved."""
+    now = home.files(rec["kind"], rec["name"])
+    if now == rec.get("files"):
+        return False
+    found = locate(gh, rec["source"], rec["kind"], rec["name"], now, path=rec["path"])
+    if not found or found["modified"] or found["commit"] == rec["commit"]:
+        return False
+    rec.update(commit=found["commit"], files=now, modified=[])
+    return True
+
+
 def cmd_outdated(home, args, gh):
     out = []
     for key, rec in sorted(home.load().items()):
@@ -477,7 +491,12 @@ def cmd_outdated(home, args, gh):
             continue
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "installed": rec["commit"],
                 "latest": sha, "date": date, "subject": subject, "modified": rec.get("modified", [])}
-        item["status"] = "current" if same_files(gh, rec, sha) else "update"
+        rebase(home, gh, rec)  # not saved here; the next update saves it
+        item["installed"] = rec["commit"]
+        c = rec.get("conflict", {})
+        item["status"] = "current" if same_files(gh, rec, sha) else "conflict" if c.get("to") == sha else "update"
+        if item["status"] == "conflict":
+            item.update(conflicts=c["files"], conflicts_dir=c["dir"])
         out.append(item)
     return {"items": out}
 
@@ -578,16 +597,10 @@ def cmd_update(home, args, gh):
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "from": rec["commit"]}
         try:
             latest, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
-            now = home.files(rec["kind"], rec["name"])
-            if now != rec.get("files"):
-                # Changed outside pkg (e.g. the mod's own installer): if the copy now equals some
-                # upstream commit exactly, that commit is the real base. A local edit matches none
-                # and keeps the recorded base, so it still merges.
-                found = locate(gh, rec["source"], rec["kind"], rec["name"], now, path=rec["path"])
-                if found and not found["modified"]:
-                    rec.update(commit=found["commit"], files=now, modified=[])
-                    item["from"] = found["commit"]
+            if rebase(home, gh, rec):
+                item["from"] = rec["commit"]
             if same_files(gh, rec, latest):
+                rec.pop("conflict", None)
                 out.append({**item, "status": "current"})
                 continue
             writes, conflicts, merged = plan_update(home, gh, rec, latest)
@@ -603,6 +616,7 @@ def cmd_update(home, args, gh):
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, "wb") as f:
                     f.write(writes[rel] or b"")
+            rec["conflict"] = {"to": latest, "files": conflicts, "dir": d}  # for `outdated` to show
             out.append({**item, "status": "conflict", "conflicts_dir": d})
             home.log("conflict", kind=rec["kind"], name=rec["name"], to=latest, files=conflicts)
             continue
@@ -615,6 +629,7 @@ def cmd_update(home, args, gh):
             home.log("rollback", kind=rec["kind"], name=rec["name"], to=latest)
             continue
         theirs = files_at(gh.tree(rec["source"], latest), rec["kind"], rec["path"])
+        rec.pop("conflict", None)
         rec.update(commit=latest, files=home.files(rec["kind"], rec["name"]),
                    modified=compare(home.files(rec["kind"], rec["name"]), theirs)[1], at=time.strftime("%Y-%m-%d"))
         out.append({**item, "status": "updated", "files": sorted(writes)})
@@ -832,6 +847,8 @@ def show(command, result):
                 print(f"     https://github.com/{i['source']}/compare/{s(i['installed'])}...{s(i['latest'])}")
                 if i["modified"]:
                     print(f"     modified here: {', '.join(i['modified'])} (an update merges your changes)")
+                if i["status"] == "conflict":
+                    print(f"⚠️  last update conflicted in {', '.join(i['conflicts'])}: {i['conflicts_dir']}")
         print(f"\n{n} update(s)")
     elif command == "update":
         for i in result["items"]:

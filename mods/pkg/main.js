@@ -18,6 +18,7 @@ const KINDS = {
 const STATUS = {
   current: ["up to date", "done", "Same files as the newest upstream commit."],
   update: ["update", "blocked", "Upstream has a newer version."],
+  conflict: ["conflict", "ansi1", "The last update conflicted with your changes; nothing was written."],
   modified: ["modified", "working", "Changed here compared with upstream; an update merges your changes in."],
   tracked: ["tracked", "muted", "Checking for updates…"],
   clone: ["clone", "dim", "A copy of one of Herdr's own; only you maintain it."],
@@ -81,7 +82,7 @@ export default class Pkg extends View {
 
   status(item) {
     const o = this.outdated[`${item.kind}:${item.name}`];
-    if (o?.status === "update") return "update";
+    if (o?.status === "update" || o?.status === "conflict") return o.status;
     if (item.status === "modified") return "modified";
     if (item.status === "tracked") return o ? "current" : "tracked";
     return item.status;
@@ -195,10 +196,11 @@ export default class Pkg extends View {
       item.cloned_from ? `clone of ${item.cloned_from.name} (${item.cloned_from.version})` : "";
     const o = this.outdated[key];
     const note = st === "update" ? `→ ${short(o.latest)} ${o.date}: ${o.subject}` :
+      st === "conflict" ? `conflict in ${o.conflicts.join(", ")}: merge by hand from ${o.conflicts_dir}, then Retry` :
       item.edited?.length ? `edited here since: ${item.edited.join(", ")}` :
       st === "modified" ? `differs from upstream in ${item.modified.join(", ")}` : meaning;
     const actions = [];
-    if (st === "update") actions.push(this.button(t, `up-${key}`, "Update", (cx) => this.update(cx, [item.name]), true));
+    if (st === "update" || st === "conflict") actions.push(this.button(t, `up-${key}`, st === "update" ? "Update" : "Retry", (cx) => this.update(cx, [item.name]), true));
     if (st === "untracked") actions.push(this.button(t, `ad-${key}`, "Adopt", (cx) => this.adopt(cx, [item.name])));
     if (item.source) actions.push(this.button(t, `gh-${key}`, "Repo", () => this.openRepo(item.source)));
     if (item.source) actions.push(this.button(t, `rm-${key}`, this.confirmRemove === key ? "Remove?" : "Remove", (cx) => this.remove(cx, item)));

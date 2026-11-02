@@ -242,6 +242,10 @@ class PkgTest(unittest.TestCase):
         self.assertIn("// mine", self.read("mods/stats/main.js"))
         with open(os.path.join(r["conflicts_dir"], "main.js")) as f:
             self.assertIn("<<<<<<<", f.read())
+        o = self.run_cmd("outdated")["items"][0]  # the row shows the conflict, not just "update"
+        self.assertEqual((o["status"], o["conflicts"]), ("conflict", ["main.js"]))
+        self.commit_upstream("ex/mods/stats/mod.json", '{"place":"top"}\n', "v5")  # newer upstream: plain update again
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "update")
 
     def test_update_rebases_a_copy_installed_outside_pkg(self):
         # Issue #6: adopted at v3, then upstream moves main.js into a subfolder and the mod's own
@@ -253,6 +257,7 @@ class PkgTest(unittest.TestCase):
         d = os.path.join(self.home_dir, "mods", "stats")
         os.remove(os.path.join(d, "main.js"))
         write(os.path.join(d, "files", "main.js"), "// moved\n")
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "current")  # re-based, not "update"
         latest = self.commit_upstream("ex/mods/stats/files/main.js", "// moved v2\n", "change")
         r = self.run_cmd("update")["items"][0]
         self.assertEqual((r["status"], r["from"], r["to"]), ("updated", moved, latest))
