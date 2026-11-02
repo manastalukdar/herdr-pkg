@@ -38,13 +38,17 @@ P=~/.config/herdr-app/mods/pkg/pkg.py
 python3 $P list                                   # what's installed, mods and layouts apart
 python3 $P outdated                               # which have updates (changes nothing)
 python3 $P update [NAME...]                       # update; your local edits are merged in
-python3 $P install OWNER/REPO[/FOLDER] [--yes]    # review, then install with --yes
+python3 $P install OWNER/REPO[/FOLDER] [--ref REF] [--yes]  # review, then install with --yes
+python3 $P pin NAME [REF]                         # stay on REF (a tag or sha; default: the installed commit)
+python3 $P unpin NAME                             # follow the default branch again
 python3 $P remove NAME [--kind mod|layout]        # a copy goes to data/pkg/removed/
 python3 $P adopt [NAME...] [--from OWNER/REPO]    # track things installed before herdr-pkg
 python3 $P browse [QUERY]                         # herdr.dev's packages
 ```
 
 Add `--json` for output a script (or the dialog) can read.
+
+`install --ref BRANCH` (or `pin NAME BRANCH`) follows that branch instead of the default one. A tag or sha pins: `update` moves to it once and then leaves it alone, and `outdated` says **pinned**.
 
 | `herdr plugin` (TUI) | herdr-pkg (app) |
 |---|---|

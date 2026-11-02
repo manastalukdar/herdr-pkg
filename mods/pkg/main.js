@@ -20,6 +20,7 @@ const KINDS = {
 const STATUS = {
   current: ["up to date", "done", "Same files as the newest upstream commit."],
   update: ["update", "blocked", "Upstream has a newer version."],
+  pinned: ["pinned", "muted", "Pinned to a tag or commit; updates skip it (pkg.py unpin NAME to follow upstream)."],
   conflict: ["conflict", "ansi1", "The last update conflicted with your changes; nothing was written."],
   modified: ["modified", "working", "Changed here compared with upstream; an update merges your changes in."],
   tracked: ["tracked", "muted", "Checking for updates…"],
@@ -88,7 +89,7 @@ export default class Pkg extends View {
 
   status(item) {
     const o = this.outdated[`${item.kind}:${item.name}`];
-    if (o?.status === "update" || o?.status === "conflict") return o.status;
+    if (o?.status === "update" || o?.status === "conflict" || o?.status === "pinned") return o.status;
     if (item.status === "modified") return "modified";
     if (item.status === "tracked") return o ? "current" : "tracked";
     return item.status;
@@ -100,7 +101,7 @@ export default class Pkg extends View {
     cx.spawn(async (cx) => this.work(cx, `Updating ${names.length ? names.join(", ") : "everything"}…`, async () => {
       const r = await this.pkg(["update", ...names]);
       const done = r.items.filter((i) => i.status === "updated");
-      const bad = r.items.filter((i) => !["updated", "current"].includes(i.status));
+      const bad = r.items.filter((i) => !["updated", "current", "pinned"].includes(i.status));
       this.message = [done.length ? `Updated ${done.map((i) => i.name).join(", ")}.` : "",
         ...bad.map((i) => `${i.name}: ${i.status}${i.conflicts?.length ? ` in ${i.conflicts.join(", ")} (see ${i.conflicts_dir})` : i.reason ? `: ${i.reason}` : ""}`)]
         .filter(Boolean).join(" ") || "Nothing to update.";

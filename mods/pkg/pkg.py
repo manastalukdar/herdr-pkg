@@ -227,11 +227,18 @@ class GitHub:
             f.write(data)
         return data
 
-    def history(self, repo, path, limit=HISTORY):
-        """Commits on the default branch that changed `path`, newest first: [(sha, date, subject)]."""
-        q = urllib.parse.quote(path)
+    def history(self, repo, path, limit=HISTORY, ref=None):
+        """Commits that changed `path` on the default branch (or up to `ref`), newest first: [(sha, date, subject)]."""
+        q = urllib.parse.quote(path) + (f"&sha={urllib.parse.quote(ref)}" if ref else "")
         return [(c["sha"], c["commit"]["committer"]["date"][:10], c["commit"]["message"].split("\n")[0])
                 for c in self._get(f"repos/{repo}/commits?path={q}&per_page={limit}")]
+
+    def is_branch(self, repo, ref):
+        try:
+            self._get(f"repos/{repo}/branches/{urllib.parse.quote(ref, safe='')}")
+            return True
+        except LookupError:  # ponytail: a network error also reads as "not a branch", i.e. pinned: the safe side
+            return False
 
     def topic(self, topic):
         """Repos with this topic (herdr.dev's index): [{"repo", "stars", "branch"}]."""
@@ -470,6 +477,19 @@ def cmd_adopt(home, args, gh):
     return {"adopted": adopted, "skipped": skipped, "untracked": left, "github_calls": gh.calls, "dry_run": args.dry_run}
 
 
+def ref_fields(gh, repo, ref):
+    """What a record keeps for a ref: a branch is followed, a tag or sha pinned."""
+    if not ref:
+        return {}
+    return {"branch": ref} if not re.fullmatch(r"[0-9a-f]{40}", ref) and gh.is_branch(repo, ref) else {"pin": ref}
+
+
+def newest(gh, rec):
+    """The newest commit that changed the package on its branch (default unless recorded), or at
+    its pin: (sha, date, subject). Used by both outdated and update."""
+    return gh.history(rec["source"], rec["path"], limit=1, ref=rec.get("pin") or rec.get("branch"))[0]
+
+
 def same_files(gh, rec, latest):
     """True when the package's files at `latest` equal those at the installed commit (the
     installed commit may be a newer repo commit that didn't touch this path)."""
@@ -495,16 +515,17 @@ def cmd_outdated(home, args, gh):
     out = []
     for key, rec in sorted(home.load().items()):
         try:
-            sha, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
+            sha, date, subject = newest(gh, rec)
         except (LookupError, IndexError) as e:
             out.append({"kind": rec["kind"], "name": rec["name"], "status": "error", "reason": str(e)})
             continue
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "installed": rec["commit"],
-                "latest": sha, "date": date, "subject": subject, "modified": rec.get("modified", [])}
+                "latest": sha, "date": date, "subject": subject, "modified": rec.get("modified", []),
+                **{k: rec[k] for k in ("pin", "branch") if k in rec}}
         rebase(home, gh, rec)  # not saved here; the next update saves it
         item["installed"] = rec["commit"]
         c = rec.get("conflict", {})
-        item["status"] = "current" if same_files(gh, rec, sha) else "conflict" if c.get("to") == sha else "update"
+        item["status"] = ("pinned" if rec.get("pin") else "current") if same_files(gh, rec, sha) else "conflict" if c.get("to") == sha else "update"
         if item["status"] == "conflict":
             item.update(conflicts=c["files"], conflicts_dir=c["dir"])
         out.append(item)
@@ -606,12 +627,12 @@ def cmd_update(home, args, gh):
             continue
         item = {"kind": rec["kind"], "name": rec["name"], "source": rec["source"], "from": rec["commit"]}
         try:
-            latest, date, subject = gh.history(rec["source"], rec["path"], limit=1)[0]
+            latest, date, subject = newest(gh, rec)
             if rebase(home, gh, rec):
                 item["from"] = rec["commit"]
             if same_files(gh, rec, latest):
                 rec.pop("conflict", None)
-                out.append({**item, "status": "current"})
+                out.append({**item, "status": "pinned" if rec.get("pin") else "current"})
                 continue
             writes, conflicts, merged = plan_update(home, gh, rec, latest)
         except (LookupError, IndexError) as e:
@@ -737,7 +758,7 @@ def cmd_install(home, args, gh):
         path = f"{base}mods/{n}" if kind == "mod" else f"{base}layouts/{n}.json"
         packages[f"{kind}:{n}"] = {"kind": kind, "name": n, "source": repo, "path": path, "commit": commit,
                                    "modified": [], "files": home.files(kind, n), "adopted": False,
-                                   "keys": [k for k in bound], "at": time.strftime("%Y-%m-%d")}
+                                   "keys": [k for k in bound], "at": time.strftime("%Y-%m-%d"), **ref_fields(gh, repo, args.ref)}
         home.log("install", kind=kind, name=n, source=repo, commit=commit)
     home.save(packages)
     return {"ok": True, "review": review, "installed": True, "items": [{"kind": k, "name": n} for k, n in done],
@@ -774,14 +795,36 @@ def cmd_browse(home, args, gh):
     return {"packages": sorted(out, key=lambda r: (-r["stars"], r["repo"], r["subdir"]))}
 
 
-def cmd_remove(home, args):
-    packages = home.load()
+def tracked(packages, args):
+    """The one record `args.name` (and `--kind`) names, or a refusal."""
     hits = [r for r in packages.values() if r["name"] == args.name and (not args.kind or r["kind"] == args.kind)]
     if not hits:
-        return {"ok": False, "reason": f"{args.name} isn't tracked by herdr-pkg: remove it by hand (or adopt it first)"}
+        return {"ok": False, "reason": f"{args.name} isn't tracked by herdr-pkg (adopt it first)"}
     if len(hits) > 1:
         return {"ok": False, "reason": f"{args.name} is both a mod and a layout: add --kind"}
-    rec = hits[0]
+    return hits[0]
+
+
+def cmd_pin(home, args, gh):
+    """`pin NAME [REF]` (no REF: the installed commit), or `unpin NAME`: back to the default branch."""
+    packages = home.load()
+    rec = tracked(packages, args)
+    if "ok" in rec:
+        return rec
+    rec.pop("pin", None)
+    rec.pop("branch", None)
+    if args.command == "pin":
+        rec.update(ref_fields(gh, rec["source"], args.ref) or {"pin": rec["commit"]})
+    home.save(packages)
+    home.log(args.command, kind=rec["kind"], name=rec["name"], ref=rec.get("pin") or rec.get("branch"))
+    return {"ok": True, "kind": rec["kind"], "name": rec["name"], **{k: rec[k] for k in ("pin", "branch") if k in rec}}
+
+
+def cmd_remove(home, args):
+    packages = home.load()
+    rec = tracked(packages, args)
+    if "ok" in rec:
+        return rec
     if rec["kind"] == "mod":
         users = home.users(rec["name"])
         if users and not args.force:
@@ -851,7 +894,9 @@ def show(command, result):
             if i["status"] == "error":
                 print(f"❓ {i['kind']} {i['name']}: {i['reason']}")
             elif i["status"] == "current":
-                print(f"✅ {i['kind']} {i['name']}: up to date ({s(i['installed'])})")
+                print(f"✅ {i['kind']} {i['name']}: up to date ({s(i['installed'])}){' on ' + i['branch'] if i.get('branch') else ''}")
+            elif i["status"] == "pinned":
+                print(f"📌 {i['kind']} {i['name']}: pinned to {s(i['pin'])}")
             else:
                 n += 1
                 print(f"⬆️  {i['kind']} {i['name']}: {s(i['installed'])} → {s(i['latest'])} ({i['date']}) {i['subject']}")
@@ -867,6 +912,8 @@ def show(command, result):
             head = f"{i['kind']} {i['name']}"
             if st == "current":
                 print(f"✅ {head}: up to date")
+            elif st == "pinned":
+                print(f"📌 {head}: pinned (pkg.py unpin {i['name']} to follow upstream)")
             elif st == "updated" or st == "would update":
                 m = f"; merged your changes into {', '.join(i['merged'])}" if i["merged"] else ""
                 print(f"⬆️  {head}: {st} {s(i['from'])} → {s(i['to'])} ({i['date']}) {i['subject']}{m}")
@@ -903,6 +950,10 @@ def show(command, result):
                                          ("layouts: " + ", ".join(r["layouts"])) if r["layouts"] else ""] if x)
             mark = " ✓" if r["installed"] else ""
             print(f"★{r['stars']:<4} {where}{mark}\n       {what}")
+    elif command in ("pin", "unpin"):
+        ref = result.get("pin") or result.get("branch")
+        print(f"✅ {result['kind']} {result['name']}: " + ("pinned to " + ref if result.get("pin") else
+              "follows " + (ref or "the default branch")) if result["ok"] else f"❌ {result['reason']}")
     elif command == "remove":
         if result["ok"]:
             print(f"✅ removed {result['kind']} {result['name']} (kept a copy in {result['moved_to']})")
@@ -934,6 +985,12 @@ def main(argv=None, home=None, gh=None):
     r.add_argument("name")
     r.add_argument("--kind", choices=["mod", "layout"])
     r.add_argument("--force", action="store_true")
+    for c in ("pin", "unpin"):
+        p = sub.add_parser(c)
+        p.add_argument("name")
+        if c == "pin":
+            p.add_argument("ref", nargs="?")
+        p.add_argument("--kind", choices=["mod", "layout"])
     args = ap.parse_args(argv)
     home = home or Home()
     if args.command == "adopt" and args.source and len(args.names) != 1:
@@ -942,7 +999,8 @@ def main(argv=None, home=None, gh=None):
     result = {"list": lambda: cmd_list(home, args), "adopt": lambda: cmd_adopt(home, args, gh),
               "outdated": lambda: cmd_outdated(home, args, gh), "update": lambda: cmd_update(home, args, gh),
               "install": lambda: cmd_install(home, args, gh), "remove": lambda: cmd_remove(home, args),
-              "browse": lambda: cmd_browse(home, args, gh)}[args.command]()
+              "browse": lambda: cmd_browse(home, args, gh), "pin": lambda: cmd_pin(home, args, gh),
+              "unpin": lambda: cmd_pin(home, args, gh)}[args.command]()
     if args.json:
         print(json.dumps(result, indent=2))
     else:
