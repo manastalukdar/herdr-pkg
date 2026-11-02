@@ -20,7 +20,7 @@ git clone https://github.com/manastalukdar/herdr-pkg
 python3 herdr-pkg/scripts/install.py
 ```
 
-It copies `mods/pkg` (after `herdr-app check`), binds **Alt+Shift+P** to the Packages dialog (unless that key is already yours), and runs `pkg.py adopt` once to match what you already have to its repos. `--no-adopt` skips that; `--uninstall` takes the mod and the key out again (what it tracks in `data/pkg/` stays). After that it updates itself: `pkg.py update pkg`.
+It copies `mods/pkg` (after `herdr-app check`), binds **Alt+Shift+P** to the Packages dialog (unless that key is already yours), and runs `pkg.py adopt` once to match what you already have to its repos. It then offers the optional status-bar block for your own layouts that have a status bar: `install.py --bar LAYOUT` puts it next to that layout's `workspace-status` (Herdr's own layouts are rewritten on every start, so clone one first). `--no-adopt` skips adopting; `--uninstall` takes the mod, the key and the block out again (what it tracks in `data/pkg/` stays). After that it updates itself: `pkg.py update pkg`.
 
 Needs Python 3.8+ (standard library only) and `git`. With [`gh`](https://cli.github.com) logged in it uses your GitHub API quota (5,000 calls an hour); without it, the anonymous API (60 an hour; `GITHUB_TOKEN` raises that). Tested on Linux (Fedora 44, Herdr app 0.1.11); CI runs the tests on Linux, macOS and Windows, but the dialog itself is only tried on Linux. On Windows the dialog runs `py -3`, else `python`; use the same in place of `python3` below. A "tried it on my machine" report is welcome ([issues](../../issues)).
 
@@ -36,7 +36,7 @@ Everything the dialog does is also a command:
 ```sh
 P=~/.config/herdr-app/mods/pkg/pkg.py
 python3 $P list                                   # what's installed, mods and layouts apart
-python3 $P outdated                               # which have updates (changes nothing)
+python3 $P outdated [--cached SECONDS]            # which have updates (changes nothing)
 python3 $P update [NAME...]                       # update; your local edits are merged in
 python3 $P install OWNER/REPO[/FOLDER] [--ref REF] [--yes]  # review, then install with --yes
       ... [--as NAME]                             # its one mod under another name
@@ -67,7 +67,7 @@ Add `--json` for output a script (or the dialog) can read.
 - **Adopting** (things installed before herdr-pkg). It hashes your files the way git does and compares them with the repos herdr.dev lists that have a package of that name (one tree per repo, fetched eight at a time and cached for a day), walking back through the commits that changed that folder until the files match. No match on every file means you changed it: it's recorded on the commit closest to your copy (most files equal, then most lines in common), marked modified, so updates merge into your changes rather than replace them. Copies of Herdr's own mods that nobody published are listed as clones and left alone. A repo herdr.dev doesn't list: `adopt NAME --from OWNER/REPO`.
 - **Updating.** Each file is merged three ways with `git merge-file`: the installed commit's version, yours, and the new one. Files you didn't touch take upstream's; files only you changed stay yours; files both changed merge, and if that conflicts nothing is written: the merged files with conflict markers go to `data/pkg/conflicts/<name>/`. The row shows **conflict** until upstream moves on or a retry succeeds. A copy changed outside pkg (say, by a mod's own installer) that equals some upstream commit is re-based onto that commit first, so it doesn't conflict with itself. The new folder is staged next to the old one and swapped in; if `herdr-app check` then fails, the old one goes back. Files Herdr generates (`*.d.ts`, `jsconfig.json`) and an installer's `runtime.json` are left out of every comparison.
 - **Installing** never overwrites: a mod or layout name you already have stops it. `--as NAME` installs a package's one mod under another name, renamed the way AGENTS.md says: its folder, its own `mods/<name>/` paths, the `"mod": "<name>"` in the package's layouts, and `mod.open:<name>` in its keys. The record keeps both names, and updates rewrite upstream's files the same way before comparing and merging, so a renamed mod updates like any other. It shows the scan first; the scan is a text match, so it can over-report, and it can't prove a package is safe.
-- **No background work.** It checks for updates when you open the dialog (or run `outdated`); nothing runs otherwise.
+- **Background work is opt-in.** Without the status-bar block, it checks for updates only when you open the dialog (or run `outdated`). With it, the block checks once a day (`outdated --cached 86400`: the last result while it's under a day old, the network after that, again whenever what's tracked changes) and shows **↑ N** (red with a conflict); a click opens the dialog.
 
 ## Development
 

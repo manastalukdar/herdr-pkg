@@ -4,7 +4,7 @@
 
 import { View, div } from "gpui-kit";
 import { h_flex, v_flex, InputState, Input } from "gpui-base";
-import { exec, appHome, props, closeOverlay, notify, theme, window } from "herdr";
+import { exec, appHome, props, closeOverlay, notify, theme, window, run } from "herdr";
 
 const short = (sha) => (sha ? sha.slice(0, 7) : "?");
 const opener = () => (window()?.platform === "macos" ? "open" : window()?.platform === "windows" ? "explorer" : "xdg-open");
@@ -32,6 +32,22 @@ const STATUS = {
 
 export default class Pkg extends View {
   init(_props, cx) {
+    // In a layout with props {bar: true}: a status-bar block, "↑ N" when updates wait (checked
+    // once a day; the cache is shared with the dialog and dropped when packages change).
+    this.bar = Boolean(props()?.bar);
+    if (this.bar) {
+      this.waiting = [];
+      const check = (cx) => cx.spawn(async (cx) => {
+        try {
+          const o = await this.pkg(["outdated", "--cached", String(24 * 3600)]);
+          this.waiting = o.items.filter((i) => i.status === "update" || i.status === "conflict");
+        } catch { /* offline or no python: show nothing */ }
+        cx.notify();
+      });
+      cx.timer.every(10 * 60 * 1000, check); // reads the cache; the network only once it's a day old
+      check(cx);
+      return;
+    }
     this.tab = props()?.tab ?? "installed"; // installed | browse | review
     this.items = [];
     this.outdated = {};
@@ -312,8 +328,19 @@ export default class Pkg extends View {
     ];
   }
 
+  barView(t) {
+    const n = this.waiting.length;
+    const conflict = this.waiting.some((i) => i.status === "conflict");
+    return h_flex().id("pkg-bar").size_full().px(8).items_center().justify_center().bg(t.chrome).text_size(12)
+      .when(n > 0, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_click(() => run("mod.open", { name: "pkg" }))
+        .child(div().text_color(conflict ? t.ansi1 : t.blocked)
+          .child(`↑ ${n}`)));
+  }
+
   render(_cx) {
     const t = theme();
+    if (this.bar) return this.barView(t);
     const body = this.tab === "browse" ? this.browseView(t) : this.tab === "review" ? this.reviewView(t) : this.installedView(t);
     return v_flex().id("root").track_focus(this.handle).size_full().p(16).gap(12).bg(t.popover).text_color(t.foreground)
       .on_key_down((e, cx) => {

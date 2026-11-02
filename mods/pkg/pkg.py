@@ -19,6 +19,7 @@ helps past 60 requests an hour). State: <herdr-app home>/data/pkg/packages.json.
 """
 import argparse
 import base64
+import contextlib
 import difflib
 import hashlib
 import json
@@ -119,6 +120,8 @@ class Home:
             json.dump({"packages": packages}, f, indent=2, sort_keys=True)
             f.write("\n")
         os.replace(tmp, os.path.join(self.data, "packages.json"))
+        with contextlib.suppress(OSError):
+            os.remove(os.path.join(self.data, "outdated.json"))  # what's tracked changed: check again
 
     def check(self, path):
         """`herdr-app check` on a mod folder: (ok, output). Layouts have no checker: always ok."""
@@ -549,6 +552,14 @@ def rebase(home, gh, rec):
 
 
 def cmd_outdated(home, args, gh):
+    """With `--cached SECONDS`, the last check's result while it's that fresh (the status-bar
+    block's daily check); every check is saved for it. Saving packages.json drops it."""
+    cache = os.path.join(home.data, "outdated.json")
+    if args.cached is not None:
+        with contextlib.suppress(OSError, ValueError):
+            if time.time() - os.path.getmtime(cache) < args.cached:
+                with open(cache, encoding="utf-8") as f:
+                    return json.load(f)
     out = []
     for key, rec in sorted(home.load().items()):
         up = upstream(gh, rec)
@@ -567,6 +578,9 @@ def cmd_outdated(home, args, gh):
         if item["status"] == "conflict":
             item.update(conflicts=c["files"], conflicts_dir=c["dir"])
         out.append(item)
+    os.makedirs(home.data, exist_ok=True)
+    with open(cache, "w", encoding="utf-8") as f:
+        json.dump({"items": out}, f)
     return {"items": out}
 
 
@@ -1024,7 +1038,7 @@ def main(argv=None, home=None, gh=None):
     a.add_argument("--import", dest="import_file")
     a.add_argument("--from", dest="source")
     a.add_argument("--dry-run", action="store_true")
-    sub.add_parser("outdated")
+    sub.add_parser("outdated").add_argument("--cached", type=int, metavar="SECONDS")
     u = sub.add_parser("update")
     u.add_argument("names", nargs="*")
     u.add_argument("--dry-run", action="store_true")

@@ -379,6 +379,54 @@ class PkgTest(unittest.TestCase):
         self.assertFalse(self.run_cmd("remove", "nowhere")["ok"])
         self.assertTrue(os.path.exists(os.path.join(self.home_dir, "mods", "nowhere")))
 
+    # ---- the status-bar block's daily check
+
+    def test_outdated_cached_reuses_the_last_check_until_packages_change(self):
+        self.install("stats", "v2")
+        self.run_cmd("adopt")
+        self.assertEqual(self.run_cmd("outdated")["items"][0]["status"], "update")
+        calls = self.gh.calls
+        self.assertEqual(self.run_cmd("outdated", "--cached", "3600")["items"][0]["status"], "update")
+        self.assertEqual(self.gh.calls, calls)  # no network
+        self.run_cmd("update")  # saving packages.json drops the cache
+        self.assertEqual(self.run_cmd("outdated", "--cached", "3600")["items"][0]["status"], "current")
+        self.assertGreater(self.gh.calls, calls)
+
+
+class InstallerBarTest(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+        import install
+        self.install = install
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def layout(self, tree):
+        from pathlib import Path
+        p = Path(self.tmp.name) / "l.json"
+        p.write_text(json.dumps(tree))
+        return p
+
+    def test_bar_joins_a_status_row_and_leaves_again(self):
+        status = {"type": "block", "content": {"mod": "workspace-status"}, "size": {"weight": 1}}
+        p = self.layout({"type": "column", "children": [{"type": "row", "size": {"px": 28}, "children": [status]}]})
+        self.assertEqual(self.install.add_bar(p), "added")
+        self.assertEqual(self.install.add_bar(p), "already has it")
+        row = json.loads(p.read_text())["children"][0]
+        self.assertEqual([c["content"]["mod"] for c in row["children"]], ["workspace-status", "pkg"])
+        self.assertTrue(self.install.remove_bar(p))
+        self.assertEqual(json.loads(p.read_text())["children"][0]["children"], [status])
+
+    def test_bar_wraps_a_lone_status_block_in_a_row(self):
+        p = self.layout({"type": "column", "children": [
+            {"type": "block", "content": {"mod": "workspace-status"}, "size": {"px": 28}}]})
+        self.install.add_bar(p)
+        row = json.loads(p.read_text())["children"][0]
+        self.assertEqual((row["type"], row["size"]), ("row", {"px": 28}))
+        self.assertEqual([c["content"]["mod"] for c in row["children"]], ["workspace-status", "pkg"])
+
 
 if __name__ == "__main__":
     unittest.main()
