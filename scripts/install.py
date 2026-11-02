@@ -28,7 +28,7 @@ def main():
     if not (home / "mods").is_dir():
         sys.exit(f"No Herdr app home at {home}. Start Herdr app once, or set HERDR_APP_HOME.")
     dest, keys_path = home / "mods" / "pkg", home / "keys.json"
-    keys = json.loads(keys_path.read_text()) if keys_path.exists() else {}
+    keys = json.loads(keys_path.read_text(encoding="utf-8")) if keys_path.exists() else {}
 
     if a.uninstall:
         if dest.exists():
@@ -42,7 +42,7 @@ def main():
         return
     if dest.exists() and not a.update:
         sys.exit("mods/pkg already exists. Use --update, or `pkg.py update pkg` once it's tracked.")
-    if dest.exists() and (home / "installed.json").exists() and "pkg" in json.loads((home / "installed.json").read_text()):
+    if dest.exists() and (home / "installed.json").exists() and "pkg" in json.loads((home / "installed.json").read_text(encoding="utf-8")):
         sys.exit("Herdr has a mod of its own called pkg; not overwriting it.")
     tmp = home / "mods" / "pkg.install-tmp"
     shutil.rmtree(tmp, ignore_errors=True)

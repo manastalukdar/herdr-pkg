@@ -8,6 +8,8 @@ import { exec, appHome, props, closeOverlay, notify, theme, window } from "herdr
 
 const short = (sha) => (sha ? sha.slice(0, 7) : "?");
 const opener = () => (window()?.platform === "macos" ? "open" : window()?.platform === "windows" ? "explorer" : "xdg-open");
+// Windows has no python3: the py launcher (python.org's installer), else python (the Store's).
+const pythons = () => (window()?.platform === "windows" ? [["py", "-3"], ["python"]] : [["python3"]]);
 
 const KINDS = {
   mod: { title: "Mods", what: "Pieces of your window: panels, dialogs, tabs and status-bar blocks. A mod shows up in whatever layout places it, or opens from a key." },
@@ -45,7 +47,11 @@ export default class Pkg extends View {
   }
 
   async pkg(args) {
-    const r = await exec("python3", [`${appHome()}/mods/pkg/pkg.py`, "--json", ...args]);
+    let r, err;
+    for (const [cmd, ...pre] of pythons()) {
+      try { r = await exec(cmd, [...pre, `${appHome()}/mods/pkg/pkg.py`, "--json", ...args]); break; } catch (e) { err = e; }
+    }
+    if (!r) throw err;
     if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim().split("\n").pop());
     return JSON.parse(r.stdout);
   }

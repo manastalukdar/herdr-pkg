@@ -21,7 +21,7 @@ def git(repo, *args):
 
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", newline="") as f:
         f.write(text)
 
 
@@ -86,6 +86,7 @@ class PkgTest(unittest.TestCase):
         git(self.up, "init", "-q", "-b", "main")
         git(self.up, "config", "user.email", "t@t")
         git(self.up, "config", "user.name", "t")
+        git(self.up, "config", "core.autocrlf", "false")  # blobs byte-for-byte what was written
         self.commits = []
         for i, body in enumerate(["v1", "v2", "v3"]):
             write(os.path.join(self.up, "ex", "mods", "stats", "main.js"), f"// {body}\nexport default 1;\n")
@@ -182,7 +183,7 @@ class PkgTest(unittest.TestCase):
     def test_edits_after_adopting_are_reported(self):
         self.install("stats", "v3")
         self.run_cmd("adopt")
-        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "a") as f:
+        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "a", newline="") as f:
             f.write("// edited\n")
         self.assertEqual(self.run_cmd("list")["items"][0]["edited"], ["main.js"])
 
@@ -218,7 +219,7 @@ class PkgTest(unittest.TestCase):
         lines = "".join(f"line {i}\n" for i in range(12))
         base = self.commit_upstream("ex/mods/stats/main.js", "// v3\n" + lines, "longer")
         self.install("stats", "v3", extra=lines.replace("export default 1;\n", ""))
-        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "w") as f:
+        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "w", newline="") as f:
             f.write("// v3 patched here\n" + lines)
         self.run_cmd("adopt")
         rec = self.home.load()["mod:stats"]
@@ -234,7 +235,7 @@ class PkgTest(unittest.TestCase):
     def test_update_conflict_writes_nothing(self):
         self.install("stats", "v3")
         self.run_cmd("adopt")
-        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "w") as f:
+        with open(os.path.join(self.home_dir, "mods", "stats", "main.js"), "w", newline="") as f:
             f.write("// mine\nexport default 1;\n")
         self.commit_upstream("ex/mods/stats/main.js", "// theirs\nexport default 1;\n", "v4")
         r = self.run_cmd("update")["items"][0]
@@ -296,6 +297,13 @@ class PkgTest(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertFalse(os.path.exists(os.path.join(self.home_dir, "mods", "stats")))
         self.assertEqual(json.loads(self.read("keys.json"))["global"], {"alt-x": "pane.zoom"})
+
+    def test_writes_files_risk_on_unix_and_windows(self):
+        rx = dict(pkg.RISKS)["writes files"]
+        for text in ['exec("rm", [f])', 'exec("cmd", ["/c", "del", f])', "Remove-Item -Recurse x", "rmdir x"]:
+            self.assertTrue(rx.search(text), text)
+        for text in ["del cache[k]", "model.delete()", "const firm = 1", "deleted"]:
+            self.assertFalse(rx.search(text), text)
 
     def test_install_refuses_a_name_clash(self):
         self.install("stats", "mine")

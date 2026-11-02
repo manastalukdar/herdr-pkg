@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import sys
@@ -56,7 +57,7 @@ class Home:
         self.root = root
         self.data = os.path.join(root, "data", "pkg")
         try:
-            with open(os.path.join(root, "installed.json")) as f:
+            with open(os.path.join(root, "installed.json"), encoding="utf-8") as f:
                 self.shipped = set(json.load(f))
         except (OSError, ValueError):
             self.shipped = set()
@@ -84,7 +85,7 @@ class Home:
     def cloned_from(self, kind, name):
         p = os.path.join(self.path(kind, name), "mod.json") if kind == "mod" else self.path(kind, name)
         try:
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 return json.load(f).get("cloned_from")
         except (OSError, ValueError, AttributeError):
             return None
@@ -105,7 +106,7 @@ class Home:
     # packages.json: {"packages": {"mod:<name>" | "layout:<name>": record}}
     def load(self):
         try:
-            with open(os.path.join(self.data, "packages.json")) as f:
+            with open(os.path.join(self.data, "packages.json"), encoding="utf-8") as f:
                 return json.load(f).get("packages", {})
         except (OSError, ValueError):
             return {}
@@ -122,12 +123,12 @@ class Home:
         """`herdr-app check` on a mod folder: (ok, output). Layouts have no checker: always ok."""
         if not os.path.isdir(path) or not _which("herdr-app"):
             return True, ""
-        r = subprocess.run(["herdr-app", "check", path], capture_output=True, text=True)
+        r = subprocess.run(["herdr-app", "check", path], capture_output=True, encoding="utf-8", errors="replace")
         return r.returncode == 0, (r.stdout + r.stderr).strip()
 
     def keys(self):
         try:
-            with open(os.path.join(self.root, "keys.json")) as f:
+            with open(os.path.join(self.root, "keys.json"), encoding="utf-8") as f:
                 return json.load(f)
         except (OSError, ValueError):
             return {}
@@ -143,7 +144,7 @@ class Home:
         for kind, name in self.inventory():
             if kind == "layout":
                 try:
-                    with open(self.path("layout", name)) as f:
+                    with open(self.path("layout", name), encoding="utf-8") as f:
                         if re.search(r'"mod"\s*:\s*"%s"' % re.escape(mod), f.read()):
                             out.append(name)
                 except OSError:
@@ -172,7 +173,7 @@ class GitHub:
         if self.use_gh is None:
             self.use_gh = subprocess.run(["gh", "auth", "status"], capture_output=True).returncode == 0 if _which("gh") else False
         if self.use_gh:
-            r = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+            r = subprocess.run(["gh", "api", path], capture_output=True, encoding="utf-8")
             if r.returncode:
                 raise LookupError(f"GitHub {path}: {(r.stderr or r.stdout).strip()[:200]}")
             return json.loads(r.stdout)
@@ -188,7 +189,7 @@ class GitHub:
     def _cached(self, name, max_age, fetch):
         p = os.path.join(self.cache, name)
         if os.path.exists(p) and (max_age is None or time.time() - os.path.getmtime(p) < max_age):
-            with open(p) as f:
+            with open(p, encoding="utf-8") as f:
                 return json.load(f)
         value = fetch()
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -282,7 +283,16 @@ class GitHub:
 
 
 def _which(cmd):
-    return any(os.access(os.path.join(d, cmd), os.X_OK) for d in os.environ.get("PATH", "").split(os.pathsep))
+    return shutil.which(cmd) is not None  # PATHEXT: finds gh.exe on Windows
+
+
+def rmtree(path):
+    """shutil.rmtree that also removes read-only files (a .git's objects on Windows)."""
+    def retry(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    if os.path.lexists(path):
+        shutil.rmtree(path, onerror=retry)  # ponytail: onerror is deprecated in 3.12 (onexc), kept for 3.8
 
 
 # ---------------------------------------------------------------- matching
@@ -407,7 +417,7 @@ def cmd_adopt(home, args, gh):
     todo = [(k, n) for k, n in inv if (not wanted or n in wanted) and f"{k}:{n}" not in packages]
     imported = {}
     if args.import_file:
-        with open(args.import_file) as f:
+        with open(args.import_file, encoding="utf-8") as f:
             src = json.load(f)
         for plural, kind in (("mods", "mod"), ("layouts", "layout")):
             for n, e in (src.get(plural) or {}).items():
@@ -562,7 +572,7 @@ def apply_files(home, kind, name, writes, fresh=False):
         os.replace(tmp, dest)
         return True, ""
     stage = dest + ".pkg-new"
-    shutil.rmtree(stage, ignore_errors=True)
+    rmtree(stage)
     if os.path.isdir(dest) and not fresh:
         shutil.copytree(dest, stage, symlinks=True)
     else:
@@ -581,7 +591,7 @@ def apply_files(home, kind, name, writes, fresh=False):
     os.replace(stage, dest)
     ok, out = home.check(dest)
     if not ok:
-        shutil.rmtree(dest)
+        rmtree(dest)
         if os.path.isdir(backup):
             os.replace(backup, dest)
     return ok, out
@@ -645,7 +655,8 @@ RISKS = [
     ("runs programs", re.compile(r"\bexec\s*\(|\bhc\s*\(|subprocess|child_process")),
     ("uses the network", re.compile(r"\bfetch\s*\(|WebSocket|urllib|curl ")),
     ("reads files", re.compile(r"readTextFile\s*\(|watchFolder\s*\(|open\(")),
-    ("writes files", re.compile(r"writeTextFile\s*\(|\brm\b|unlink|rmtree")),
+    # rm/rmdir (Unix), Remove-Item (PowerShell), a quoted "del" (cmd.exe; Python's `del x` is unquoted)
+    ("writes files", re.compile(r"writeTextFile\s*\(|\brm\b|\brmdir\b|Remove-Item|[\"']del\b|unlink|rmtree")),
 ]
 
 
@@ -935,6 +946,8 @@ def main(argv=None, home=None, gh=None):
     if args.json:
         print(json.dumps(result, indent=2))
     else:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")  # the emoji, piped on a Windows code page
         show(args.command, result)
     return 0
 
