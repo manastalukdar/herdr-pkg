@@ -440,5 +440,20 @@ class InstallerBarTest(unittest.TestCase):
         self.assertEqual([c["content"]["mod"] for c in row["children"]], ["workspace-status", "pkg"])
 
 
+class TopicPagesTest(unittest.TestCase):
+    def test_topic_reads_every_page_of_the_search(self):
+        total = 441  # reality of herdr-mod on 2026-11-07
+
+        class Search(pkg.GitHub):
+            def _get(self, path):
+                page = int(path.rsplit("page=", 1)[1])
+                first = (page - 1) * 100
+                return {"items": [{"full_name": f"o/r{first + i}", "stargazers_count": 0, "default_branch": "main"}
+                                  for i in range(max(0, min(100, total - first)))]}
+
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(len(Search(d).topic("herdr-mod")), total)
+
+
 if __name__ == "__main__":
     unittest.main()
