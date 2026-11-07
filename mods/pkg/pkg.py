@@ -249,7 +249,7 @@ class GitHub:
         """Repos with this topic (herdr.dev's index): [{"repo", "stars", "branch"}]."""
         def fetch():
             out = []
-            for page in range(1, 4):
+            for page in range(1, 11):  # GitHub's search returns at most 1000 results
                 r = self._get(f"search/repositories?q=topic:{topic}&per_page=100&page={page}")
                 out += [{"repo": i["full_name"], "stars": i["stargazers_count"], "branch": i["default_branch"],
                          "description": i.get("description") or "", "pushed": (i.get("pushed_at") or "")[:10]}
